@@ -34,6 +34,7 @@ from decimal import Decimal, ROUND_HALF_EVEN
 # ============================== SETTINGS ==============================
 COINS = ["btc", "eth", "sol", "xrp"]
 ORDER_USD = 1.00          # every paper order is $1
+STARTING_BALANCE = 100.0  # each strategy gets its own $100 paper account
 POLL_EVERY = 1.0          # seconds between order-book reads
 WINDOW_SECONDS = 900      # 15 minutes
 
@@ -195,6 +196,10 @@ class PaperBook:
     def place_window(self, m, book):
         orders = []
         for s in STRATEGIES:
+            cash = strategy_cash(self.db, s["name"])
+            if cash < 2 * ORDER_USD + 0.10:
+                log.info("%s skipped %s: only $%.2f paper cash left", s["name"], m["slug"], cash)
+                continue
             if s["kind"] == "maker":
                 for side in ("up", "down"):
                     p = s["bid"]
@@ -262,6 +267,21 @@ class PaperBook:
         now = time.time()
         for o in self.open.pop(slug, []):
             self.db.execute("UPDATE paper_orders SET cancelled_at=? WHERE id=? AND cancelled_at IS NULL", (now, o["id"]))
+
+
+def strategy_cash(db, strategy):
+    """Paper cash: $100 + settled profit/loss - money tied up in open or resting orders."""
+    realized = db.execute("""
+        SELECT COALESCE(SUM(CASE WHEN o.side = m.winner THEN o.shares ELSE 0 END - o.usd - o.fee), 0)
+        FROM paper_orders o JOIN markets m ON m.slug = o.slug
+        WHERE o.strategy = ? AND m.winner IS NOT NULL AND o.filled_cautious IS NOT NULL""", (strategy,)).fetchone()[0]
+    tied = db.execute("""
+        SELECT COALESCE(SUM(o.usd + o.fee), 0)
+        FROM paper_orders o JOIN markets m ON m.slug = o.slug
+        WHERE o.strategy = ? AND m.winner IS NULL AND m.window_end > ?
+          AND (o.filled_cautious IS NOT NULL OR o.cancelled_at IS NULL)""",
+        (strategy, time.time() - 3 * 3600)).fetchone()[0]
+    return STARTING_BALANCE + realized - tied
 
 
 def window_pnl(db, slug, winner, mode="cautious"):
@@ -429,6 +449,7 @@ def start_web():
         return
     key = os.environ.get("REPORT_KEY", "")
     import analyze
+    import dashboard
 
     class H(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -443,15 +464,32 @@ def start_web():
                 self.wfile.write(b"add ?key=YOUR_REPORT_KEY to the address")
                 return
             k = f"&key={urllib.parse.quote(key)}" if key else ""
-            links = [("All coins", f"/?x=1{k}"), ("Last 24h", f"/?hours=24{k}")]
-            links += [(c.upper(), f"/?coin={c}{k}") for c in COINS]
+            links = [("Dashboard", f"/?x=1{k}"), ("All coins", f"/report?x=1{k}"), ("Last 24h", f"/report?hours=24{k}")]
+            links += [(c.upper(), f"/report?coin={c}{k}") for c in COINS]
             links += [("Live log", f"/log?x=1{k}"), ("Market check", f"/check?x=1{k}")]
             nav = "".join(f'<a href="{h}">{t}</a>' for t, h in links)
+            if u.path in ("/", "/api"):
+                try:
+                    if u.path == "/":
+                        out, ctype = dashboard.PAGE.encode(), "text/html; charset=utf-8"
+                    else:
+                        data = dashboard.summary(DB_PATH, q.get("mode", ["cautious"])[0], q.get("coin", [""])[0],
+                                                     STARTING_BALANCE, [x["name"] for x in STRATEGIES])
+                        out, ctype = json.dumps(data, default=list).encode(), "application/json"
+                    self.send_response(200)
+                except Exception as e:
+                    out, ctype = json.dumps({"error": repr(e)}).encode(), "application/json"
+                    self.send_response(500)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(out)
+                return
             if u.path == "/log":
                 body = "\n".join(reversed(RECENT_LOG)) or "(no log lines yet)"
             elif u.path == "/check":
                 body = _capture(check)
-            elif u.path == "/":
+            elif u.path == "/report":
                 argv = ["--db", DB_PATH]
                 if q.get("coin"):
                     argv += ["--coin", q["coin"][0]]

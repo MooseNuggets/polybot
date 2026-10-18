@@ -2,7 +2,7 @@
 
 Watches the 15-minute **Up or Down** markets for **BTC, ETH, SOL and XRP** on Polymarket US,
 logs every order book once a second, and paper trades "bid both sides" strategies at **$1 per order**.
-No account, no API key, no real money.
+No account, no API key, no real money. Each strategy has its own **$100 paper account** and stops trading if it runs out.
 
 ## What it paper trades (every window, every coin)
 

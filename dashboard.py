@@ -1,0 +1,354 @@
+"""
+Dashboard for the Polymarket paper trader: JSON summary + a single HTML page.
+Served by logger.py at  /  (page)  and  /api  (data).
+"""
+import sqlite3
+import time
+from collections import defaultdict
+from datetime import datetime
+
+
+def _pnl_rows(db, mode, coin=None):
+    """One row per (window, strategy): fills and profit/loss."""
+    col = "filled_cautious" if mode == "cautious" else "filled_hopeful"
+    q = f"""SELECT m.slug, m.coin, m.window_start, m.window_end, m.winner,
+                   o.strategy, o.side, o.usd, o.shares, o.fee, o.{col}
+            FROM paper_orders o JOIN markets m ON m.slug = o.slug
+            WHERE m.winner IS NOT NULL""" + (" AND m.coin = ?" if coin else "")
+    out = {}
+    for slug, c, ws, we, winner, strat, side, usd, shares, fee, filled in db.execute(q, (coin,) if coin else ()):
+        k = (slug, strat)
+        r = out.setdefault(k, {"slug": slug, "coin": c, "start": ws, "end": we, "winner": winner,
+                               "strategy": strat, "fills": set(), "pnl": 0.0, "spent": 0.0})
+        if filled is None:
+            continue
+        r["fills"].add(side)
+        r["pnl"] += (shares if side == winner else 0.0) - usd - fee
+        r["spent"] += usd + fee
+    return list(out.values())
+
+
+def summary(db_path, mode="cautious", coin=None, start_balance=100.0, strategy_names=()):
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+    now = time.time()
+    coin = coin or None
+
+    last, first, nsnap = db.execute("SELECT MAX(ts), MIN(ts), COUNT(*) FROM snapshots").fetchone()
+    rows = _pnl_rows(db, mode, coin)
+
+    # ---------- per strategy ----------
+    strat = defaultdict(lambda: {"windows": 0, "both": 0, "one": 0, "none": 0, "spent": 0.0, "pnl": 0.0,
+                                 "today": 0.0, "wins": 0, "losses": 0})
+    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    for r in rows:
+        s = strat[r["strategy"]]
+        s["windows"] += 1
+        n = len(r["fills"])
+        s["both" if n == 2 else "one" if n == 1 else "none"] += 1
+        s["spent"] += r["spent"]
+        s["pnl"] += r["pnl"]
+        if r["end"] >= midnight:
+            s["today"] += r["pnl"]
+        if n:
+            if r["pnl"] > 1e-9:
+                s["wins"] += 1
+            elif r["pnl"] < -1e-9:
+                s["losses"] += 1
+    strategies = []
+    for name, s in strat.items():
+        w = s["windows"] or 1
+        traded = s["wins"] + s["losses"]
+        strategies.append({
+            "name": name, "windows": s["windows"],
+            "both": s["both"] / w, "one": s["one"] / w, "none": s["none"] / w,
+            "spent": s["spent"], "pnl": s["pnl"], "today": s["today"],
+            "roi": (s["pnl"] / s["spent"]) if s["spent"] else None,
+            "win_rate": (s["wins"] / traded) if traded else None,
+        })
+    have = {s["name"] for s in strategies}
+    for n in strategy_names:
+        if n not in have:
+            strategies.append({"name": n, "windows": 0, "both": 0, "one": 0, "none": 0, "spent": 0.0,
+                               "pnl": 0.0, "today": 0.0, "roi": None, "win_rate": None})
+    strategies.sort(key=lambda x: x["pnl"], reverse=True)
+
+    # money tied up in windows that haven't settled yet
+    col = "filled_cautious" if mode == "cautious" else "filled_hopeful"
+    tied = dict(db.execute(f"""
+        SELECT o.strategy, SUM(o.usd + o.fee) FROM paper_orders o JOIN markets m ON m.slug = o.slug
+        WHERE m.winner IS NULL AND m.window_end > ? AND (o.{col} IS NOT NULL OR o.cancelled_at IS NULL)
+        """ + (" AND m.coin = ?" if coin else "") + " GROUP BY o.strategy",
+        (now - 3 * 3600, coin) if coin else (now - 3 * 3600,)).fetchall())
+    for s in strategies:
+        s["equity"] = start_balance + s["pnl"]
+        s.setdefault("drawdown", 0.0)
+        s["cash"] = s["equity"] - (tied.get(s["name"]) or 0.0)
+
+    # ---------- equity curves ----------
+    by_end = defaultdict(lambda: defaultdict(float))
+    for r in rows:
+        by_end[r["end"]][r["strategy"]] += r["pnl"]
+    names = [s["name"] for s in strategies]
+    cum = {n: start_balance for n in names}
+    peak = {n: start_balance for n in names}
+    dd = {n: 0.0 for n in names}
+    series = {n: [] for n in names}
+    times = []
+    for t in sorted(by_end):
+        for n in names:
+            cum[n] += by_end[t].get(n, 0.0)
+            peak[n] = max(peak[n], cum[n])
+            dd[n] = max(dd[n], (peak[n] - cum[n]) / peak[n] if peak[n] else 0.0)
+            series[n].append(round(cum[n], 4))
+        times.append(t)
+    for s in strategies:
+        s["drawdown"] = dd.get(s["name"], 0.0)
+    step = max(1, len(times) // 300)
+    if step > 1:
+        idx = list(range(0, len(times), step))
+        if idx[-1] != len(times) - 1:
+            idx.append(len(times) - 1)
+        times = [times[i] for i in idx]
+        series = {n: [v[i] for i in idx] for n, v in series.items()}
+
+    # ---------- windows ----------
+    settled = db.execute("SELECT COUNT(*), SUM(winner='up') FROM markets WHERE winner IS NOT NULL"
+                         + (" AND coin = ?" if coin else ""), (coin,) if coin else ()).fetchone()
+
+    # ---------- live markets ----------
+    live = []
+    for slug, c, ws, we, ptb in db.execute(
+            "SELECT slug, coin, window_start, window_end, price_to_beat FROM markets "
+            "WHERE window_start <= ? AND window_end > ? ORDER BY coin", (now, now)):
+        if coin and c != coin:
+            continue
+        snap = db.execute("SELECT bid, ask, last_px, ts FROM snapshots WHERE slug = ? ORDER BY ts DESC LIMIT 1",
+                          (slug,)).fetchone()
+        bid, ask, lastpx, ts = snap if snap else (None, None, None, None)
+        orders = defaultdict(dict)
+        col = "filled_cautious" if mode == "cautious" else "filled_hopeful"
+        for st, side, price, filled, canc in db.execute(
+                f"SELECT strategy, side, price, {col}, cancelled_at FROM paper_orders WHERE slug = ?", (slug,)):
+            orders[st][side] = {"price": price, "filled": filled is not None, "cancelled": canc is not None}
+        live.append({"coin": c, "slug": slug, "left": we - now, "elapsed": now - ws,
+                     "up_bid": bid, "up_ask": ask,
+                     "down_bid": (1 - ask) if ask is not None else None,
+                     "down_ask": (1 - bid) if bid is not None else None,
+                     "last": lastpx, "age": (now - ts) if ts else None, "ptb": ptb, "orders": orders})
+
+    # ---------- recent results ----------
+    recent = defaultdict(lambda: {"pnl": {}})
+    for r in rows:
+        k = r["slug"]
+        recent[k].update({"coin": r["coin"], "end": r["end"], "winner": r["winner"]})
+        recent[k]["pnl"][r["strategy"]] = {"pnl": r["pnl"], "fills": len(r["fills"])}
+    recent = sorted(recent.values(), key=lambda x: (x["end"], x["coin"]), reverse=True)[:40]
+
+    # ---------- spread ----------
+    spread = {}
+    for c, avg, n in db.execute(
+            "SELECT m.coin, AVG(s.ask - s.bid), COUNT(*) FROM snapshots s JOIN markets m ON m.slug = s.slug "
+            "WHERE s.ask IS NOT NULL AND s.bid IS NOT NULL AND s.ts > ? GROUP BY m.coin", (now - 6 * 3600,)):
+        spread[c] = avg
+
+    db.close()
+    return {
+        "now": now, "mode": mode, "coin": coin, "start": start_balance,
+        "status": {"age": (now - last) if last else None, "hours": ((last - first) / 3600) if last else 0,
+                   "book_reads": nsnap, "settled": settled[0] or 0, "up_wins": settled[1] or 0},
+        "strategies": strategies,
+        "equity": {"times": times, "series": series},
+        "live": live, "recent": recent, "spread": spread,
+    }
+
+
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Polybot</title>
+<style>
+:root{--bg:#0d1016;--card:#151a22;--line:#262d38;--txt:#e8ecf2;--mut:#8a94a6;--grn:#3ecf8e;--red:#f2555a;--blu:#7aa2ff;--chip:#1d2430}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font:15px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{max-width:900px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:28px;margin:0;display:flex;align-items:center;gap:12px}
+.badge{font-size:14px;font-weight:600;color:var(--blu);background:#1c2a4a;padding:5px 12px;border-radius:999px}
+.sub{color:var(--mut);margin-top:6px;font-size:14px}
+.row{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0 6px}
+.btn{background:var(--card);color:var(--txt);border:1px solid var(--line);border-radius:12px;padding:10px 16px;font-size:15px;cursor:pointer;text-decoration:none}
+.btn.on{border-color:var(--blu);color:var(--blu)}
+h2{font-size:14px;letter-spacing:.12em;color:var(--mut);margin:30px 0 12px;text-transform:uppercase}
+.tiles{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(min-width:700px){.tiles{grid-template-columns:repeat(4,1fr)}}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px 18px}
+.tile .k{color:var(--mut);font-size:14px}
+.tile .v{font-size:26px;font-weight:600;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tile .s{color:var(--mut);font-size:12px;margin-top:2px}
+.pos{color:var(--grn)}.neg{color:var(--red)}.mut{color:var(--mut)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;overflow:hidden}
+svg{display:block;width:100%;height:auto}
+.legend{display:flex;flex-wrap:wrap;gap:12px;margin-top:10px;font-size:13px;color:var(--mut)}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.tbl{width:100%;border-collapse:collapse;font-size:14px}
+.tbl th{color:var(--mut);font-weight:500;text-align:right;padding:8px 6px;border-bottom:1px solid var(--line);white-space:nowrap}
+.tbl td{text-align:right;padding:10px 6px;border-bottom:1px solid var(--line);white-space:nowrap}
+.tbl th:first-child,.tbl td:first-child{text-align:left}
+.tbl tr:last-child td{border-bottom:0}
+.scroll{overflow-x:auto}
+.mk{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(min-width:700px){.mk{grid-template-columns:repeat(4,1fr)}}
+.mk .tile .v{font-size:20px}
+.bar{height:6px;background:var(--chip);border-radius:3px;margin:10px 0 8px;overflow:hidden}
+.bar b{display:block;height:100%;background:var(--blu)}
+.dots{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.dot{font-size:11px;padding:3px 7px;border-radius:6px;background:var(--chip);color:var(--mut)}
+.dot.f{background:#163a2b;color:var(--grn)}
+.pill{font-size:12px;font-weight:600;padding:2px 8px;border-radius:999px}
+.pill.up{background:#163a2b;color:var(--grn)}.pill.down{background:#3a1a1d;color:var(--red)}
+.note{color:var(--mut);font-size:13px;margin-top:10px}
+.err{background:#3a1a1d;color:var(--red);padding:12px;border-radius:12px;margin-top:14px;display:none}
+</style></head>
+<body><div class="wrap">
+  <h1>Polybot <span class="badge">PAPER</span></h1>
+  <div class="sub" id="sub">Loading…</div>
+  <div class="err" id="err"></div>
+
+  <div class="row" id="coins"></div>
+  <div class="row" id="modes"></div>
+
+  <h2>Account</h2>
+  <div class="row" id="strs" style="margin-top:0"></div>
+  <div class="tiles" id="tiles"></div>
+
+  <h2>Equity by strategy ($)</h2>
+  <div class="card"><div id="chart"></div><div class="legend" id="legend"></div></div>
+
+  <h2>Strategies</h2>
+  <div class="card scroll"><table class="tbl" id="strats"></table></div>
+  <div class="note">Both = Up and Down both filled (locked profit). One = only one side filled (a straight bet). Each order is $1.</div>
+
+  <h2>Live markets</h2>
+  <div class="mk" id="live"></div>
+
+  <h2>Recent windows</h2>
+  <div class="card scroll"><table class="tbl" id="recent"></table></div>
+
+  <div class="row" style="margin-top:28px" id="links"></div>
+</div>
+<script>
+const qs = new URLSearchParams(location.search);
+const KEY = qs.get("key") || "";
+let coin = qs.get("coin") || "";
+let mode = qs.get("mode") || "cautious";
+let pick = qs.get("strategy") || "";
+let last = null;
+const COINS = ["", "btc", "eth", "sol", "xrp"];
+let START = 100;
+const COLORS = ["#7aa2ff","#3ecf8e","#f5b84a","#c58af9","#f2555a","#4fd1c5","#e879a7"];
+const k = KEY ? "key=" + encodeURIComponent(KEY) : "";
+const $ = id => document.getElementById(id);
+const money = (v, d=2) => v == null ? "–" : (v < 0 ? "-$" : "$") + Math.abs(v).toFixed(d);
+const smoney = v => v == null ? "–" : (v > 0 ? "+" : v < 0 ? "-" : "") + "$" + Math.abs(v).toFixed(2);
+const cls = v => v > 1e-9 ? "pos" : v < -1e-9 ? "neg" : "";
+const pct = v => v == null ? "–" : (v * 100).toFixed(0) + "%";
+const spct = v => v == null ? "–" : (v > 0 ? "+" : "") + (v * 100).toFixed(1) + "%";
+const c2 = v => v == null ? "–" : Math.round(v * 100) + "¢";
+const fmtT = t => new Date(t * 1000).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+const mmss = s => s == null ? "–" : Math.max(0, Math.floor(s / 60)) + ":" + String(Math.max(0, Math.floor(s % 60))).padStart(2, "0");
+
+function chips() {
+  $("coins").innerHTML = COINS.map(c => `<button class="btn ${c===coin?'on':''}" data-c="${c}">${c ? c.toUpperCase() : "All coins"}</button>`).join("");
+  $("modes").innerHTML = [["cautious","Cautious fills"],["hopeful","Hopeful fills"]]
+    .map(([m,t]) => `<button class="btn ${m===mode?'on':''}" data-m="${m}">${t}</button>`).join("");
+  document.querySelectorAll("[data-c]").forEach(b => b.onclick = () => { coin = b.dataset.c; chips(); load(); });
+  document.querySelectorAll("[data-m]").forEach(b => b.onclick = () => { mode = b.dataset.m; chips(); load(); });
+  $("links").innerHTML = [["Text report","/report"],["Live log","/log"],["Market check","/check"]]
+    .map(([t,u]) => `<a class="btn" href="${u}?${k}">${t}</a>`).join("");
+}
+
+function tile(k, v, c="", s="") { return `<div class="tile"><div class="k">${k}</div><div class="v ${c}">${v}</div>${s?`<div class="s">${s}</div>`:""}</div>`; }
+
+function chart(eq, names) {
+  const W = 420, H = 230, P = {l: 50, r: 8, t: 10, b: 24};
+  if (!eq.times.length) { $("chart").innerHTML = `<div class="mut" style="padding:40px 8px;text-align:center">The chart starts after the first 15-minute window settles.</div>`; $("legend").innerHTML=""; return; }
+  let lo = Infinity, hi = -Infinity;
+  names.forEach(n => eq.series[n].forEach(v => { lo = Math.min(lo, v); hi = Math.max(hi, v); }));
+  lo = Math.min(lo, START); hi = Math.max(hi, START);
+  if (hi - lo < 1) { hi += 0.5; lo -= 0.5; }
+  const pad = (hi - lo) * 0.08; hi += pad; lo -= pad;
+  const N = eq.times.length;
+  const x = i => P.l + (N === 1 ? (W - P.l - P.r) / 2 : i * (W - P.l - P.r) / (N - 1));
+  const y = v => P.t + (hi - v) * (H - P.t - P.b) / (hi - lo);
+  let g = "";
+  for (let j = 0; j <= 4; j++) {
+    const v = lo + (hi - lo) * j / 4, yy = y(v);
+    g += `<line x1="${P.l}" x2="${W-P.r}" y1="${yy}" y2="${yy}" stroke="#262d38" stroke-dasharray="3 4"/>`;
+    g += `<text x="${P.l-8}" y="${yy+4}" fill="#8a94a6" font-size="12" text-anchor="end">${money(v)}</text>`;
+  }
+  g += `<line x1="${P.l}" x2="${W-P.r}" y1="${y(START)}" y2="${y(START)}" stroke="#4a5363"/>`;
+  [0, N - 1].forEach((i, j) => { if (j && N < 2) return; g += `<text x="${x(i)}" y="${H-8}" fill="#8a94a6" font-size="12" text-anchor="${j?'end':'start'}">${fmtT(eq.times[i])}</text>`; });
+  names.forEach((n, i) => {
+    const pts = eq.series[n].map((v, j) => `${x(j).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+    g += N === 1 ? `<circle cx="${x(0)}" cy="${y(eq.series[n][0])}" r="4" fill="${COLORS[i%COLORS.length]}"/>`
+                 : `<polyline points="${pts}" fill="none" stroke="${COLORS[i%COLORS.length]}" stroke-width="2" stroke-linejoin="round"/>`;
+  });
+  $("chart").innerHTML = `<svg viewBox="0 0 ${W} ${H}">${g}</svg>`;
+  $("legend").innerHTML = names.map((n, i) => `<span><i style="background:${COLORS[i%COLORS.length]}"></i>${n} <b class="${cls(eq.series[n].at(-1) - START)}">${money(eq.series[n].at(-1))}</b></span>`).join("");
+}
+
+function render(d) {
+  const s = d.status;
+  const ok = s.age != null && s.age < 60;
+  $("sub").innerHTML = `Updated ${new Date(d.now*1000).toLocaleTimeString()} · ${ok ? '<span class="pos">● running</span>' : '<span class="neg">● stalled</span>'} · ${s.hours.toFixed(1)}h of data`;
+  const st = d.strategies;
+  START = d.start;
+  if (!st.find(x => x.name === pick)) pick = st.length ? st[0].name : "";
+  $("strs").innerHTML = st.map(x => `<button class="btn ${x.name===pick?'on':''}" data-s="${x.name}">${x.name}</button>`).join("");
+  document.querySelectorAll("[data-s]").forEach(b => b.onclick = () => { pick = b.dataset.s; render(last); });
+  const a = st.find(x => x.name === pick);
+  $("tiles").innerHTML = a ? (
+    tile("Equity", money(a.equity), "", `started with ${money(d.start, 0)}`) +
+    tile("Return", spct(a.pnl / d.start), cls(a.pnl)) +
+    tile("Today", smoney(a.today), cls(a.today)) +
+    tile("Drawdown", (a.drawdown * 100).toFixed(1) + "%", a.drawdown > 0.1 ? "neg" : "") +
+    tile("Cash", money(a.cash), "", "equity minus open orders") +
+    tile("Win rate", pct(a.win_rate), "", "windows with a profit") +
+    tile("Windows traded", a.windows.toLocaleString(), "", s.settled ? `Up won ${pct(s.up_wins / s.settled)}` : "waiting for first result") +
+    tile("Both sides filled", pct(a.both), "", `one side only ${pct(a.one)}`)
+  ) : "";
+
+  chart(d.equity, st.map(x => x.name));
+
+  $("strats").innerHTML = `<tr><th>Strategy</th><th>Equity</th><th>Windows</th><th>Both</th><th>One</th><th>None</th><th>Win rate</th><th>P/L</th><th>ROI</th></tr>` +
+    (st.length ? st.map(x => `<tr><td>${x.name}</td><td class="${cls(x.pnl)}">${money(x.equity)}</td><td>${x.windows}</td><td>${pct(x.both)}</td><td>${pct(x.one)}</td><td>${pct(x.none)}</td><td>${pct(x.win_rate)}</td><td class="${cls(x.pnl)}">${smoney(x.pnl)}</td><td class="${cls(x.pnl)}">${spct(x.roi)}</td></tr>`).join("")
+               : `<tr><td colspan="9" class="mut">No settled windows yet.</td></tr>`);
+
+  $("live").innerHTML = d.live.length ? d.live.map(m => {
+    const sp = (m.up_ask != null && m.up_bid != null) ? m.up_ask - m.up_bid : null;
+    const dots = Object.entries(m.orders).map(([n, o]) => {
+      const f = (o.up && o.up.filled ? "U" : "") + (o.down && o.down.filled ? "D" : "");
+      return `<span class="dot ${f ? 'f' : ''}">${n.replace("maker_", "").replace("taker_both", "taker")} ${f || "–"}</span>`;
+    }).join("");
+    return `<div class="tile"><div class="k">${m.coin.toUpperCase()} · ${mmss(m.left)} left</div>
+      <div class="bar"><b style="width:${Math.min(100, m.elapsed / 9)}%"></b></div>
+      <div class="v"><span class="pos">↑ ${c2(m.up_ask)}</span> <span class="neg">↓ ${c2(m.down_ask)}</span></div>
+      <div class="s">cost to buy both ${m.up_ask != null && m.down_ask != null ? "$" + (m.up_ask + m.down_ask).toFixed(2) : "–"} · spread ${c2(sp)}</div>
+      <div class="dots">${dots || '<span class="dot">orders go in at the next window</span>'}</div></div>`;
+  }).join("") : `<div class="tile mut">No live 15-minute windows right now.</div>`;
+
+  const names = st.map(x => x.name);
+  $("recent").innerHTML = `<tr><th>Window</th><th>Result</th>${names.map(n => `<th>${n.replace("maker_","").replace("taker_both","taker")}</th>`).join("")}</tr>` +
+    (d.recent.length ? d.recent.map(r => `<tr><td>${r.coin.toUpperCase()} ${fmtT(r.end - 900)}</td><td><span class="pill ${r.winner}">${r.winner.toUpperCase()}</span></td>${names.map(n => { const p = r.pnl[n]; return `<td class="${p ? cls(p.pnl) : 'mut'}">${p && p.fills ? smoney(p.pnl) : "–"}</td>`; }).join("")}</tr>`).join("")
+                     : `<tr><td colspan="9" class="mut">Nothing settled yet.</td></tr>`);
+}
+
+async function load() {
+  try {
+    const r = await fetch(`/api?mode=${mode}&coin=${coin}&${k}`);
+    if (!r.ok) throw new Error(r.status === 403 ? "Wrong or missing key in the address." : "Server error " + r.status);
+    last = await r.json(); render(last);
+    $("err").style.display = "none";
+  } catch (e) { $("err").textContent = e.message; $("err").style.display = "block"; }
+}
+chips(); load(); setInterval(load, 10000);
+</script></body></html>"""
