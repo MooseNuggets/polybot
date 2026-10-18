@@ -37,6 +37,7 @@ ORDER_USD = 1.00          # every paper order is $1
 STARTING_BALANCE = 100.0  # each strategy gets its own $100 paper account
 POLL_EVERY = 1.0          # seconds between order-book reads
 WINDOW_SECONDS = 900      # 15 minutes
+ENTRY_SECONDS = 60        # paper orders go in during the first minute of each window
 
 # Paper strategies. Each one runs on every window, for every coin.
 #   bid:    the price we rest a buy order at, on BOTH Up and Down
@@ -117,6 +118,47 @@ def fee(theta, shares, p):
 
 
 # ------------------------------ discovery ------------------------------
+def parse_updown(mk):
+    """Turn a Polymarket US market into our dict if it's a 15-min Up/Down for one of our coins."""
+    if not isinstance(mk, dict):
+        return None
+    apt = mk.get("assetPriceTerms") or {}
+    mtype = str(apt.get("marketType", ""))
+    horizon = str(apt.get("horizon", "")).lower()
+    coin = str((apt.get("asset") or {}).get("symbol", "")).lower()
+    if "UP_DOWN" not in mtype or coin not in COINS:
+        return None
+    if horizon and horizon not in ("15m", "15min", "15", "pt15m", "900s"):
+        return None
+    ws, we = iso_ts(apt.get("windowStart")), iso_ts(apt.get("windowEnd"))
+    if not ws or not we or abs((we - ws) - WINDOW_SECONDS) > 5 or not mk.get("slug"):
+        return None
+    return {"slug": mk["slug"], "coin": coin, "start": ws, "end": we, "ptb": amt(apt.get("priceToBeat"))}
+
+
+def slug_stamp(t):
+    return time.strftime("%Y-%m-%d-%H%M", time.gmtime(t))
+
+
+def guess_next_slug(known, start):
+    """Polymarket names windows like ...-updown-15m-2026-10-18-2045z. Swap in the next window's time."""
+    old = slug_stamp(known["start"])
+    if old not in known["slug"]:
+        return None
+    return known["slug"].replace(old, slug_stamp(start))
+
+
+def lookup_slug(slug):
+    try:
+        data = http_json(f"/v1/market/slug/{urllib.parse.quote(slug)}")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+    mk = data.get("market", data) if isinstance(data, dict) else None
+    return parse_updown(mk)
+
+
 def find_markets():
     """All open 15-minute Up/Down crypto markets for our coins."""
     found, offset = [], 0
@@ -125,19 +167,9 @@ def find_markets():
                                          "limit": 200, "offset": offset})
         batch = data.get("markets", data if isinstance(data, list) else [])
         for mk in batch:
-            apt = mk.get("assetPriceTerms") or {}
-            mtype = str(apt.get("marketType", ""))
-            horizon = str(apt.get("horizon", "")).lower()
-            coin = str((apt.get("asset") or {}).get("symbol", "")).lower()
-            if "UP_DOWN" not in mtype or coin not in COINS:
-                continue
-            if horizon and horizon not in ("15m", "15min", "15", "pt15m", "900s"):
-                continue
-            ws, we = iso_ts(apt.get("windowStart")), iso_ts(apt.get("windowEnd"))
-            if not ws or not we or abs((we - ws) - WINDOW_SECONDS) > 5:
-                continue
-            found.append({"slug": mk["slug"], "coin": coin, "start": ws, "end": we,
-                          "ptb": amt(apt.get("priceToBeat"))})
+            m = parse_updown(mk)
+            if m:
+                found.append(m)
         if len(batch) < 200:
             break
         offset += 200
@@ -307,35 +339,66 @@ class Runner:
         self.prev = {}         # slug -> previous book
         self.placed = set()
         self.totals = {}
+        self.known = {}        # coin -> most recent market seen (used to guess the next window's name)
+
+    def _track(self, m):
+        now = time.time()
+        if m["end"] < now or m["start"] > now + WINDOW_SECONDS + 120:
+            return False
+        if m["slug"] in self.markets:
+            if m["ptb"] and not self.markets[m["slug"]].get("ptb"):
+                self.markets[m["slug"]]["ptb"] = m["ptb"]
+                self.db.execute("UPDATE markets SET price_to_beat=? WHERE slug=?", (m["ptb"], m["slug"]))
+            return False
+        self.markets[m["slug"]] = m
+        self.known[m["coin"]] = m
+        self.db.execute("INSERT OR IGNORE INTO markets(slug,coin,window_start,window_end,price_to_beat)"
+                        " VALUES(?,?,?,?,?)", (m["slug"], m["coin"], m["start"], m["end"], m["ptb"]))
+        log.info("tracking %s (%.0fs into window)", m["slug"], now - m["start"])
+        return True
 
     async def discover(self):
+        """Full market scan once a minute."""
         while True:
             try:
                 found = await asyncio.to_thread(find_markets)
-                now = time.time()
-                n_new = 0
-                for m in found:
-                    # only keep the window running now and the next one
-                    if m["end"] < now or m["start"] > now + WINDOW_SECONDS + 120:
-                        continue
-                    if m["slug"] not in self.markets:
-                        self.markets[m["slug"]] = m
-                        self.db.execute("INSERT OR IGNORE INTO markets(slug,coin,window_start,window_end,price_to_beat)"
-                                        " VALUES(?,?,?,?,?)", (m["slug"], m["coin"], m["start"], m["end"], m["ptb"]))
-                        n_new += 1
-                    elif m["ptb"] and not self.markets[m["slug"]].get("ptb"):
-                        self.markets[m["slug"]]["ptb"] = m["ptb"]
-                        self.db.execute("UPDATE markets SET price_to_beat=? WHERE slug=?", (m["ptb"], m["slug"]))
+                for m in sorted(found, key=lambda x: x["start"]):
+                    self._track(m)
+                    if m["coin"] not in self.known or m["start"] > self.known[m["coin"]]["start"]:
+                        self.known[m["coin"]] = m
                 self.db.commit()
-                if n_new:
-                    log.info("tracking %d new windows", n_new)
-                coins_seen = {m["coin"] for m in found}
-                missing = [c for c in COINS if c not in coins_seen]
+                missing = [c for c in COINS if c not in {m["coin"] for m in found}]
                 if missing:
                     log.info("no open 15-min markets found for: %s", ",".join(missing))
             except Exception as e:
                 log.warning("market lookup failed: %s", e)
             await asyncio.sleep(60)
+
+    async def fast_discover(self):
+        """Around each 15-minute boundary, look up the next window by name every 2 seconds
+        so orders go in right as it opens."""
+        while True:
+            now = time.time()
+            nxt = (now // WINDOW_SECONDS + 1) * WINDOW_SECONDS
+            cur = nxt - WINDOW_SECONDS
+            for start in (cur, nxt):
+                if not (start - 30 <= now <= start + 60):
+                    continue
+                for coin in COINS:
+                    k = self.known.get(coin)
+                    if not k or any(m["coin"] == coin and abs(m["start"] - start) < 5 for m in self.markets.values()):
+                        continue
+                    slug = guess_next_slug(k, start)
+                    if not slug:
+                        continue
+                    try:
+                        m = await asyncio.to_thread(lookup_slug, slug)
+                    except Exception as e:
+                        log.warning("quick lookup %s failed: %s", slug, e)
+                        m = None
+                    if m and self._track(m):
+                        self.db.commit()
+            await asyncio.sleep(2)
 
     async def poll(self):
         last_commit = last_health = time.time()
@@ -359,7 +422,7 @@ class Runner:
                                 (now, m["slug"], round(t_in, 2), book["bid"], book["bid_sz"], book["ask"],
                                  book["ask_sz"], book["last"], book["traded"], book["state"]))
                 rows += 1
-                if 0 <= t_in <= 10 and m["slug"] not in self.placed and book["bid"] is not None and book["ask"] is not None:
+                if 0 <= t_in <= ENTRY_SECONDS and m["slug"] not in self.placed and book["bid"] is not None and book["ask"] is not None:
                     self.paper.place_window(m, book)
                     self.placed.add(m["slug"])
                 elif m["slug"] in self.placed:
@@ -522,7 +585,7 @@ async def main():
     start_web()
     for ln in _capture(check).splitlines():
         log.info("check: %s", ln)
-    await asyncio.gather(r.discover(), r.poll(), r.settle())
+    await asyncio.gather(r.discover(), r.fast_discover(), r.poll(), r.settle())
 
 
 def check():
