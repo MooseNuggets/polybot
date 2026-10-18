@@ -14,9 +14,9 @@ def _pnl_rows(db, mode, coin=None):
     q = f"""SELECT m.slug, m.coin, m.window_start, m.window_end, m.winner,
                    o.strategy, o.side, o.usd, o.shares, o.fee, o.{col}
             FROM paper_orders o JOIN markets m ON m.slug = o.slug
-            WHERE m.winner IS NOT NULL""" + (" AND m.coin = ?" if coin else "")
+            WHERE m.winner IS NOT NULL AND (o.mode IS NULL OR o.mode = ?)""" + (" AND m.coin = ?" if coin else "")
     out = {}
-    for slug, c, ws, we, winner, strat, side, usd, shares, fee, filled in db.execute(q, (coin,) if coin else ()):
+    for slug, c, ws, we, winner, strat, side, usd, shares, fee, filled in db.execute(q, (mode, coin) if coin else (mode,)):
         k = (slug, strat)
         r = out.setdefault(k, {"slug": slug, "coin": c, "start": ws, "end": we, "winner": winner,
                                "strategy": strat, "fills": set(), "pnl": 0.0, "spent": 0.0})
@@ -77,8 +77,9 @@ def summary(db_path, mode="cautious", coin=None, start_balance=100.0, strategy_n
     tied = dict(db.execute(f"""
         SELECT o.strategy, SUM(o.usd + o.fee) FROM paper_orders o JOIN markets m ON m.slug = o.slug
         WHERE m.winner IS NULL AND m.window_end > ? AND (o.{col} IS NOT NULL OR o.cancelled_at IS NULL)
+          AND (o.mode IS NULL OR o.mode = ?)
         """ + (" AND m.coin = ?" if coin else "") + " GROUP BY o.strategy",
-        (now - 3 * 3600, coin) if coin else (now - 3 * 3600,)).fetchall())
+        (now - 3 * 3600, mode, coin) if coin else (now - 3 * 3600, mode)).fetchall())
     for s in strategies:
         s["equity"] = start_balance + s["pnl"]
         s.setdefault("drawdown", 0.0)
@@ -128,7 +129,8 @@ def summary(db_path, mode="cautious", coin=None, start_balance=100.0, strategy_n
         orders = defaultdict(dict)
         col = "filled_cautious" if mode == "cautious" else "filled_hopeful"
         for st, side, price, filled, canc in db.execute(
-                f"SELECT strategy, side, price, {col}, cancelled_at FROM paper_orders WHERE slug = ?", (slug,)):
+                f"SELECT strategy, side, price, {col}, cancelled_at FROM paper_orders "
+                "WHERE slug = ? AND (mode IS NULL OR mode = ?)", (slug, mode)):
             orders[st][side] = {"price": price, "filled": filled is not None, "cancelled": canc is not None}
         live.append({"coin": c, "slug": slug, "left": we - now, "elapsed": now - ws,
                      "up_bid": bid, "up_ask": ask,
@@ -244,7 +246,7 @@ let pick = qs.get("strategy") || "";
 let last = null;
 const COINS = ["", "btc", "eth", "sol", "xrp"];
 let START = 100;
-const COLORS = ["#7aa2ff","#3ecf8e","#f5b84a","#c58af9","#f2555a","#4fd1c5","#e879a7"];
+const COLORS = ["#7aa2ff","#3ecf8e","#f5b84a","#c58af9","#f2555a","#4fd1c5","#e879a7","#a3e635","#fb923c"];
 const k = KEY ? "key=" + encodeURIComponent(KEY) : "";
 const $ = id => document.getElementById(id);
 const money = (v, d=2) => v == null ? "–" : (v < 0 ? "-$" : "$") + Math.abs(v).toFixed(d);

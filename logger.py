@@ -19,6 +19,7 @@ import html
 import http.server
 import io
 import json
+import math
 import threading
 import logging
 import os
@@ -49,7 +50,20 @@ STRATEGIES = [
     {"name": "maker_46", "kind": "maker", "bid": 0.46, "cancel": 720},
     {"name": "maker_44", "kind": "maker", "bid": 0.44, "cancel": 720},
     {"name": "taker_both", "kind": "taker"},   # baseline: what instantly buying both costs
+
+    # FOLLOW: keep both bids a few cents under the live price and re-adjust every second.
+    # Once one side fills at p, the other side's bid moves to the best price that still
+    # locks in a profit (1 - p - 1 cent) and keeps following the market there.
+    {"name": "follow_1", "kind": "follow", "edge": 0.01, "cancel": 720},
+    {"name": "follow_2", "kind": "follow", "edge": 0.02, "cancel": 720},
+
+    # HEDGE: once one side fills, instantly buy the other side (paying the taker fee)
+    # as soon as the pair costs no more than $1.02 in total, i.e. a loss of at most 2 cents
+    # per share pair. Caps the damage when the price doesn't come back.
+    {"name": "follow_2h", "kind": "follow", "edge": 0.02, "cancel": 720, "hedge": 0.02},
+    {"name": "maker_49h", "kind": "maker_hedge", "bid": 0.49, "cancel": 720, "hedge": 0.02},
 ]
+LOCK_PROFIT = 0.01        # follow: minimum profit per share pair it aims to lock after the first fill
 
 # Fees (Polymarket US fee schedule): fee = theta * contracts * p * (1 - p), rounded to the cent.
 TAKER_THETA = 0.0695
@@ -77,7 +91,7 @@ CREATE TABLE IF NOT EXISTS paper_orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     strategy TEXT, slug TEXT, coin TEXT, side TEXT,
     price REAL, usd REAL, shares REAL, fee REAL,
-    placed_at REAL, filled_cautious REAL, filled_hopeful REAL, cancelled_at REAL
+    placed_at REAL, filled_cautious REAL, filled_hopeful REAL, cancelled_at REAL, mode TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_snap_slug ON snapshots(slug);
 CREATE INDEX IF NOT EXISTS idx_po_slug ON paper_orders(slug);
@@ -213,6 +227,135 @@ def read_settlement(slug):
 
 
 # ------------------------------ paper trading ------------------------------
+def would_fill(side, p, book, last, mode):
+    """Would our resting buy of `side` at price p have filled, given this book and trade?"""
+    if side == "up":      # bid at p on the Up book
+        ask = book["ask"]
+        if mode == "cautious":
+            return (ask is not None and ask < p - 1e-9) or (last is not None and last < p - 1e-9)
+        return (ask is not None and ask <= p + 1e-9) or (last is not None and last <= p + 1e-9)
+    q = 1 - p             # buying Down at p = offering Up at 1 - p
+    bid = book["bid"]
+    if mode == "cautious":
+        return (bid is not None and bid > q + 1e-9) or (last is not None and last > q + 1e-9)
+    return (bid is not None and bid >= q - 1e-9) or (last is not None and last >= q - 1e-9)
+
+
+def side_ask(book, side):
+    if side == "up":
+        return book["ask"]
+    return None if book["bid"] is None else round(1 - book["bid"], 4)
+
+
+def cents_down(x):
+    return math.floor(x * 100 + 1e-6) / 100
+
+
+def follow_quotes(book, edge):
+    """Bid both sides `edge` below the live midpoint, never crossing the book."""
+    if book["bid"] is None or book["ask"] is None:
+        return None
+    mid = (book["bid"] + book["ask"]) / 2
+    up = min(cents_down(mid - edge), round(book["ask"] - 0.01, 2))
+    dn = min(cents_down(1 - mid - edge), round(1 - book["bid"] - 0.01, 2))
+    if up < 0.02 or dn < 0.02:
+        return None
+    return {"up": up, "down": dn}
+
+
+class DynSim:
+    """
+    One strategy whose behaviour depends on what has filled (follow / hedge).
+    Because fills differ between the cautious and hopeful views, each view runs as its own
+    simulation, and its orders are tagged with that mode.
+    """
+
+    def __init__(self, db, s, m, mode, prices):
+        self.db, self.s, self.m, self.mode = db, s, m, mode
+        self.legs = {}
+        self.first = None
+        self.done = False
+        for side, p in prices.items():
+            self.legs[side] = self._insert(side, p, ORDER_USD / p, MAKER_THETA, filled=False)
+
+    def _insert(self, side, p, shares, theta, filled):
+        now = time.time()
+        usd = shares * p
+        f = fee(theta, shares, p)
+        cur = self.db.execute(
+            "INSERT INTO paper_orders(strategy,slug,coin,side,price,usd,shares,fee,placed_at,"
+            "filled_cautious,filled_hopeful,mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (self.s["name"], self.m["slug"], self.m["coin"], side, p, usd, shares, f, now,
+             now if filled else None, now if filled else None, self.mode))
+        return {"id": cur.lastrowid, "price": p, "shares": shares, "filled": filled}
+
+    def _reprice(self, side, p, shares):
+        leg = self.legs[side]
+        if abs(leg["price"] - p) < 1e-9 and abs(leg["shares"] - shares) < 1e-9:
+            return
+        leg["price"], leg["shares"] = p, shares
+        self.db.execute("UPDATE paper_orders SET price=?, shares=?, usd=? WHERE id=?",
+                        (p, shares, shares * p, leg["id"]))
+
+    def _fill(self, side, now):
+        self.legs[side]["filled"] = True
+        self.db.execute("UPDATE paper_orders SET filled_cautious=?, filled_hopeful=? WHERE id=?",
+                        (now, now, self.legs[side]["id"]))
+
+    def finish(self, now):
+        for leg in self.legs.values():
+            if not leg["filled"]:
+                self.db.execute("UPDATE paper_orders SET cancelled_at=? WHERE id=? AND cancelled_at IS NULL",
+                                (now, leg["id"]))
+        self.done = True
+
+    def step(self, book, last, t_in, now):
+        if self.done:
+            return
+        if t_in >= self.s["cancel"]:
+            self.finish(now)
+            return
+        # 1. did anything fill at the prices we were showing?
+        for side, leg in self.legs.items():
+            if not leg["filled"] and would_fill(side, leg["price"], book, last, self.mode):
+                self._fill(side, now)
+                if self.first is None:
+                    self.first = side
+        if all(l["filled"] for l in self.legs.values()):
+            self.done = True
+            return
+        # 2. nothing filled yet: follow keeps both bids tracking the market
+        if self.first is None:
+            if self.s["kind"] == "follow":
+                q = follow_quotes(book, self.s["edge"])
+                if q:
+                    for side in ("up", "down"):
+                        self._reprice(side, q[side], ORDER_USD / q[side])
+            return
+        # 3. one side filled: work the other side
+        p_first = self.legs[self.first]["price"]
+        shares = self.legs[self.first]["shares"]          # match shares so the pair pays out exactly
+        other = "down" if self.first == "up" else "up"
+        ask = side_ask(book, other)
+        hedge = self.s.get("hedge")
+        if hedge is not None and ask is not None:
+            cost = ask + p_first + TAKER_THETA * ask * (1 - ask)
+            if cost <= 1 + hedge + 1e-9:
+                leg = self.legs[other]
+                self.db.execute("UPDATE paper_orders SET price=?, shares=?, usd=?, fee=?, "
+                                "filled_cautious=?, filled_hopeful=? WHERE id=?",
+                                (ask, shares, shares * ask, fee(TAKER_THETA, shares, ask), now, now, leg["id"]))
+                leg.update(price=ask, shares=shares, filled=True)
+                self.done = True
+                return
+        if self.s["kind"] == "follow":
+            target = cents_down(1 - p_first - LOCK_PROFIT)
+            if ask is not None:
+                target = min(target, round(ask - 0.01, 2))
+            if target >= 0.01:
+                self._reprice(other, target, shares)
+
+
 class PaperBook:
     """
     Polymarket US has ONE order book per market, priced in Up (long) terms.
@@ -224,6 +367,7 @@ class PaperBook:
     def __init__(self, db):
         self.db = db
         self.open = {}   # slug -> list of order dicts still working
+        self.dyn = {}    # slug -> list of DynSim
 
     def place_window(self, m, book):
         orders = []
@@ -248,6 +392,22 @@ class PaperBook:
                     continue
                 for side, p in (("up", book["ask"]), ("down", round(1 - book["bid"], 4))):
                     orders.append(self._new(s, m, side, p, TAKER_THETA, filled=True))
+            elif s["kind"] in ("follow", "maker_hedge"):
+                if s["kind"] == "follow":
+                    prices = follow_quotes(book, s["edge"])
+                else:
+                    prices = {}
+                    for side in ("up", "down"):
+                        p = s["bid"]
+                        a = side_ask(book, side)
+                        if a is not None and p >= a:
+                            p = round(a - 0.01, 2)
+                        if p > 0.01:
+                            prices[side] = p
+                if not prices or len(prices) < 2:
+                    continue
+                for mode in ("cautious", "hopeful"):
+                    self.dyn.setdefault(m["slug"], []).append(DynSim(self.db, s, m, mode, prices))
         self.db.commit()
         self.open[m["slug"]] = [o for o in orders if o["filled_c"] is None or o["filled_h"] is None]
 
@@ -265,13 +425,15 @@ class PaperBook:
 
     def update(self, m, book, prev, t_in):
         """Check resting orders against the latest book and the latest trade."""
-        orders = self.open.get(m["slug"])
-        if not orders:
-            return
         now = time.time()
         new_trade = (book["traded"] is not None and prev and prev.get("traded") is not None
                      and book["traded"] > prev["traded"])
         last = book["last"] if new_trade else None
+        for sim in self.dyn.get(m["slug"], []):
+            sim.step(book, last, t_in, now)
+        orders = self.open.get(m["slug"])
+        if not orders:
+            return
         keep = []
         for o in orders:
             s, p = o["strategy"], o["price"]
@@ -297,6 +459,9 @@ class PaperBook:
 
     def close_window(self, slug):
         now = time.time()
+        for sim in self.dyn.pop(slug, []):
+            if not sim.done:
+                sim.finish(now)
         for o in self.open.pop(slug, []):
             self.db.execute("UPDATE paper_orders SET cancelled_at=? WHERE id=? AND cancelled_at IS NULL", (now, o["id"]))
 
@@ -306,11 +471,13 @@ def strategy_cash(db, strategy):
     realized = db.execute("""
         SELECT COALESCE(SUM(CASE WHEN o.side = m.winner THEN o.shares ELSE 0 END - o.usd - o.fee), 0)
         FROM paper_orders o JOIN markets m ON m.slug = o.slug
-        WHERE o.strategy = ? AND m.winner IS NOT NULL AND o.filled_cautious IS NOT NULL""", (strategy,)).fetchone()[0]
+        WHERE o.strategy = ? AND m.winner IS NOT NULL AND o.filled_cautious IS NOT NULL
+          AND (o.mode IS NULL OR o.mode = 'cautious')""", (strategy,)).fetchone()[0]
     tied = db.execute("""
         SELECT COALESCE(SUM(o.usd + o.fee), 0)
         FROM paper_orders o JOIN markets m ON m.slug = o.slug
         WHERE o.strategy = ? AND m.winner IS NULL AND m.window_end > ?
+          AND (o.mode IS NULL OR o.mode = 'cautious')
           AND (o.filled_cautious IS NOT NULL OR o.cancelled_at IS NULL)""",
         (strategy, time.time() - 3 * 3600)).fetchone()[0]
     return STARTING_BALANCE + realized - tied
@@ -321,7 +488,8 @@ def window_pnl(db, slug, winner, mode="cautious"):
     col = "filled_cautious" if mode == "cautious" else "filled_hopeful"
     out = {}
     for strat, side, usd, shares, f, filled in db.execute(
-            f"SELECT strategy, side, usd, shares, fee, {col} FROM paper_orders WHERE slug=?", (slug,)):
+            f"SELECT strategy, side, usd, shares, fee, {col} FROM paper_orders "
+            "WHERE slug=? AND (mode IS NULL OR mode=?)", (slug, mode)):
         if filled is None:
             out.setdefault(strat, 0.0)
             continue
@@ -579,6 +747,10 @@ async def main():
     db = sqlite3.connect(DB_PATH)
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript(SCHEMA)
+    try:
+        db.execute("ALTER TABLE paper_orders ADD COLUMN mode TEXT")
+    except sqlite3.OperationalError:
+        pass
     r = Runner(db)
     log.info("Polymarket US 15-min logger + paper trader | coins: %s | $%.2f per order",
              ",".join(COINS), ORDER_USD)

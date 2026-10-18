@@ -62,8 +62,12 @@ def main(argv=None):
     winners = {s[0]: s[2] for s in settled}
     coin_of = {s[0]: s[1] for s in settled}
 
-    orders = db.execute("""SELECT strategy, slug, side, price, usd, shares, fee, filled_cautious, filled_hopeful
-                           FROM paper_orders""").fetchall()
+    try:
+        orders = db.execute("""SELECT strategy, slug, side, price, usd, shares, fee, filled_cautious, filled_hopeful, mode
+                               FROM paper_orders""").fetchall()
+    except sqlite3.OperationalError:
+        orders = [r + (None,) for r in db.execute("""SELECT strategy, slug, side, price, usd, shares, fee,
+                                                     filled_cautious, filled_hopeful FROM paper_orders""")]
 
     # ---------- 2. paper results ----------
     for mode, idx, title in (("cautious", 7, "2. PAPER RESULTS - CAUTIOUS fills (price traded THROUGH our order)"),
@@ -72,8 +76,8 @@ def main(argv=None):
         line(title)
         # per strategy, per window
         win = defaultdict(lambda: defaultdict(lambda: {"fills": set(), "pnl": 0.0, "spent": 0.0}))
-        for strat, slug, side, price, usd, shares, f, fc, fh in orders:
-            if slug not in winners:
+        for strat, slug, side, price, usd, shares, f, fc, fh, omode in orders:
+            if slug not in winners or (omode and omode != mode):
                 continue
             cell = win[strat][slug]
             if (fc if mode == "cautious" else fh) is None:
