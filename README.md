@@ -22,7 +22,19 @@ Each fill is scored two ways: **cautious** (price traded *through* your order) a
 
 To change prices, the cancel time, or the $1 size, edit the SETTINGS block at the top of `logger.py`.
 
-## Setup (about 15 minutes, no coding)
+## Setup on Railway (easiest from a phone)
+
+1. Go to **railway.com**, sign in with GitHub, and pick the **Hobby** plan (~$5/month).
+2. **New Project → Deploy from GitHub repo → MooseNuggets/polybot.** Allow Railway access to the repo if asked.
+3. Open the service, then **Variables → New Variable**: `REPORT_KEY` = a password you make up.
+4. Right-click (long-press) the service, or use **+ Create → Volume**. Attach a volume to the service with mount path **`/data`**. This keeps your data when it redeploys.
+5. **Settings → Networking → Generate Domain.** That's your report page.
+6. Open `https://YOUR-DOMAIN/?key=YOUR_REPORT_KEY` on your phone and bookmark it.
+
+The page has buttons for the report, each coin, the last 24 hours, the live log, and a market check.
+Every time new code is pushed to GitHub, Railway redeploys automatically.
+
+## Alternative: setup on a DigitalOcean server
 
 **1. Put these files on GitHub**
 - github.com → New repository → name it `polybot` → Create

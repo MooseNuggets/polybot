@@ -13,7 +13,13 @@ Everything goes into one file: data/polylog.db
 Run `python logger.py check` once to confirm the markets are being found.
 """
 import asyncio
+import collections
+import contextlib
+import html
+import http.server
+import io
 import json
+import threading
 import logging
 import os
 import sqlite3
@@ -385,6 +391,88 @@ class Runner:
         return "  ".join(f"{k} ${v:+.2f}" for k, v in sorted(self.totals.items())) or "(nothing settled yet)"
 
 
+# ------------------------------ web report (for checking from a phone) ------------------------------
+RECENT_LOG = collections.deque(maxlen=400)
+
+
+class _RingHandler(logging.Handler):
+    def emit(self, record):
+        RECENT_LOG.append(self.format(record))
+
+
+_rh = _RingHandler()
+_rh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+log.addHandler(_rh)
+
+PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Polybot</title>
+<style>body{{margin:0;background:#111;color:#ddd;font:14px -apple-system,system-ui,sans-serif}}
+nav{{display:flex;gap:8px;flex-wrap:wrap;padding:12px;background:#1b1b1b;position:sticky;top:0}}
+nav a{{color:#fff;background:#333;padding:8px 12px;border-radius:8px;text-decoration:none}}
+pre{{padding:12px;margin:0;font:12px ui-monospace,Menlo,monospace;white-space:pre;overflow-x:auto}}</style>
+</head><body><nav>{nav}</nav><pre>{body}</pre></body></html>"""
+
+
+def _capture(fn, *args):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        try:
+            fn(*args)
+        except Exception as e:
+            print(f"\nERROR: {e!r}")
+    return buf.getvalue()
+
+
+def start_web():
+    port = os.environ.get("PORT")
+    if not port:
+        return
+    key = os.environ.get("REPORT_KEY", "")
+    import analyze
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            q = urllib.parse.parse_qs(u.query)
+            if key and q.get("key", [""])[0] != key:
+                self.send_response(403)
+                self.end_headers()
+                self.wfile.write(b"add ?key=YOUR_REPORT_KEY to the address")
+                return
+            k = f"&key={urllib.parse.quote(key)}" if key else ""
+            links = [("All coins", f"/?x=1{k}"), ("Last 24h", f"/?hours=24{k}")]
+            links += [(c.upper(), f"/?coin={c}{k}") for c in COINS]
+            links += [("Live log", f"/log?x=1{k}"), ("Market check", f"/check?x=1{k}")]
+            nav = "".join(f'<a href="{h}">{t}</a>' for t, h in links)
+            if u.path == "/log":
+                body = "\n".join(reversed(RECENT_LOG)) or "(no log lines yet)"
+            elif u.path == "/check":
+                body = _capture(check)
+            elif u.path == "/":
+                argv = ["--db", DB_PATH]
+                if q.get("coin"):
+                    argv += ["--coin", q["coin"][0]]
+                if q.get("hours"):
+                    argv += ["--hours", q["hours"][0]]
+                body = _capture(analyze.main, argv)
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+            out = PAGE.format(nav=nav, body=html.escape(body)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(out)
+
+    srv = http.server.ThreadingHTTPServer(("0.0.0.0", int(port)), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    log.info("report page listening on port %s", port)
+
+
 async def main():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     db = sqlite3.connect(DB_PATH)
@@ -393,6 +481,9 @@ async def main():
     r = Runner(db)
     log.info("Polymarket US 15-min logger + paper trader | coins: %s | $%.2f per order",
              ",".join(COINS), ORDER_USD)
+    start_web()
+    for ln in _capture(check).splitlines():
+        log.info("check: %s", ln)
     await asyncio.gather(r.discover(), r.poll(), r.settle())
 
 

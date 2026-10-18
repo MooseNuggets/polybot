@@ -22,12 +22,12 @@ def line(t=""):
         print("=" * 66)
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=DB)
     ap.add_argument("--coin", default=None)
     ap.add_argument("--hours", type=float, default=None)
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if not os.path.exists(a.db):
         print("No data yet. Is the logger running?")
         return
