@@ -18,8 +18,8 @@ close, much of the result is already known. In the last 2 minutes of every windo
 
 | Account       | Minimum edge to bet |
 |---------------|---------------------|
-| closer        | 3¢ per share after fees |
-| closer_strict | 6¢ per share after fees |
+| closer        | Favorites only: market price 70¢+, model 85%+, edge 3¢+ after fees |
+| closer_strict | Favorites only: market price 80¢+, model 95%+, edge 5¢+ after fees |
 
 The **Model check** on the dashboard compares the model's odds with the market's own prices
 30 seconds before each close. If the model's score isn't lower than the market's, there's no edge.

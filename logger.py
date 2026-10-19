@@ -51,8 +51,10 @@ STRATEGIES = [
     # it is already known), and buy whichever side the market is pricing too cheaply.
     # One $1 bet per window at most. Skips the window if there's no clear edge.
     #   edge: minimum gap (after fees) between our odds and the market price, in dollars per share
-    {"name": "closer", "kind": "closer", "edge": 0.03},
-    {"name": "closer_strict", "kind": "closer", "edge": 0.06},
+    #   min_price / min_prob: FAVORITES ONLY - only buy a side the market already prices at 70c+
+    #   and our model puts at 85%+. (Betting on cheap long shots lost money: the market was right.)
+    {"name": "closer", "kind": "closer", "edge": 0.03, "min_price": 0.70, "min_prob": 0.85},
+    {"name": "closer_strict", "kind": "closer", "edge": 0.05, "min_price": 0.80, "min_prob": 0.95},
 ]
 CLOSER_FROM = 120         # start looking this many seconds before the window closes
 CLOSER_UNTIL = 5          # stop this many seconds before the close (orders need time to land)
@@ -673,6 +675,8 @@ class Closer:
                                         ("down", down_ask, 1 - p_up, book["bid_sz"])):
                 if ask is None or ask <= 0 or ask >= 1:
                     continue
+                if ask < st.get("min_price", 0) or p < st.get("min_prob", 0):
+                    continue          # favorites only
                 edge = p - ask - TAKER_THETA * ask * (1 - ask)
                 if edge >= st["edge"] and (depth or 0) >= ORDER_USD / ask and (best is None or edge > best[2]):
                     best = (side, ask, edge)
