@@ -46,13 +46,13 @@ ENTRY_SECONDS = 60        # paper orders go in during the first minute of each w
 #   kind:   "maker" = resting limit orders, "taker" = buy both instantly at window open
 STRATEGIES = [
     # Reference: rest a 49c bid on Up AND Down at window open; cancel unfilled at 12:00.
-    {"name": "maker_49", "kind": "maker", "bid": 0.49, "cancel": 720},
+    {"name": "simple_49", "kind": "maker", "bid": 0.49, "cancel": 720},
 
     # FOLLOW + HEDGE: keep both bids 2c under the live price, re-adjusting every second.
     # Once one side fills at p, the other side's bid moves to the best price that still locks
     # in a profit (1 - p - 1c). It also buys the other side outright (taker fee) as soon as
     # the pair costs no more than $1.02 in total, capping one-sided losses.
-    {"name": "follow_2h", "kind": "follow", "edge": 0.02, "cancel": 720, "hedge": 0.02},
+    {"name": "follow_hedge", "kind": "follow", "edge": 0.02, "cancel": 720, "hedge": 0.02},
 
     # OPTIMIZED (no laddering - only one pair working at a time):
     #   band:      only start a pair while the market is between 35/65 and 65/35. A lopsided
@@ -60,7 +60,7 @@ STRATEGIES = [
     #   new_until: never start a new pair after 10:00 into the window (late fills are the
     #              most one-sided); a pair already half done keeps working until 14:00.
     #   pairs:     after a pair completes (profit locked), start a fresh one, up to 5 per window.
-    {"name": "follow_2hr", "kind": "follow", "edge": 0.02, "cancel": 840, "new_until": 600,
+    {"name": "optimized", "kind": "follow", "edge": 0.02, "cancel": 840, "new_until": 600,
      "band": (0.35, 0.65), "pairs": 5, "hedge": 0.02},
 ]
 LOCK_PROFIT = 0.01        # follow: minimum profit per share pair it aims to lock after the first fill

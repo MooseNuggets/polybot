@@ -341,7 +341,7 @@ function render(d) {
   }).join("") : `<div class="tile mut">No live 15-minute windows right now.</div>`;
 
   const names = st.map(x => x.name);
-  $("recent").innerHTML = `<tr><th>Window</th><th>Result</th>${names.map(n => `<th>${n.replace("maker_","").replace("taker_both","taker")}</th>`).join("")}</tr>` +
+  $("recent").innerHTML = `<tr><th>Window</th><th>Result</th>${names.map(n => `<th>${n.replace("follow_hedge","hedge").replace("simple_49","49")}</th>`).join("")}</tr>` +
     (d.recent.length ? d.recent.map(r => `<tr><td>${r.coin.toUpperCase()} ${fmtT(r.end - 900)}</td><td><span class="pill ${r.winner}">${r.winner.toUpperCase()}</span></td>${names.map(n => { const p = r.pnl[n]; return `<td class="${p ? cls(p.pnl) : 'mut'}">${p && p.fills ? smoney(p.pnl) : "–"}</td>`; }).join("")}</tr>`).join("")
                      : `<tr><td colspan="9" class="mut">Nothing settled yet.</td></tr>`);
 }
