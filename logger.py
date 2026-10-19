@@ -21,6 +21,7 @@ import io
 import json
 import math
 import threading
+import traceback
 import logging
 import os
 import sqlite3
@@ -38,7 +39,7 @@ ORDER_USD = 1.00          # every paper order is $1
 STARTING_BALANCE = 100.0  # each strategy gets its own $100 paper account
 POLL_EVERY = 1.0          # seconds between order-book reads
 WINDOW_SECONDS = 900      # 15 minutes
-ENTRY_SECONDS = 60        # paper orders go in during the first minute of each window
+ENTRY_SECONDS = 180       # paper orders can go in during the first 3 minutes of each window
 
 # Paper strategies. Each one runs on every window, for every coin.
 #   bid:    the price we rest a buy order at, on BOTH Up and Down
@@ -481,7 +482,11 @@ class PaperBook:
                      and book["traded"] > prev["traded"])
         last = book["last"] if new_trade else None
         for sim in self.dyn.get(m["slug"], []):
-            sim.step(book, last, t_in, now)
+            try:
+                sim.step(book, last, t_in, now)
+            except Exception:
+                log.exception("%s error on %s (stopping it for this window)", sim.s["name"], m["slug"])
+                sim.done = True
         orders = self.open.get(m["slug"])
         if not orders:
             return
@@ -622,20 +627,30 @@ class Runner:
     async def poll(self):
         last_commit = last_health = time.time()
         rows = 0
+        errs = {}
         while True:
+          try:
             await asyncio.sleep(POLL_EVERY - (time.time() % POLL_EVERY))
             now = time.time()
+            HEARTBEAT[0] = now
             live = [m for m in self.markets.values() if m["start"] - 5 <= now <= m["end"]]
             if not live:
                 continue
-            results = await asyncio.gather(*(asyncio.to_thread(read_book, m["slug"]) for m in live),
-                                           return_exceptions=True)
+            results = await asyncio.gather(*(asyncio.wait_for(asyncio.to_thread(read_book, m["slug"]), 8)
+                                             for m in live), return_exceptions=True)
+            HEARTBEAT[0] = time.time()
+            limited = False
             for m, book in zip(live, results):
-                if isinstance(book, Exception):
+                if isinstance(book, BaseException):
+                    n = errs.get(m["slug"], 0) + 1
+                    errs[m["slug"]] = n
+                    if n in (1, 10) or n % 60 == 0:
+                        log.warning("book read failed for %s (%d times): %r", m["slug"], n, book)
                     if isinstance(book, urllib.error.HTTPError) and book.code == 429:
-                        log.warning("rate limited; slowing down")
-                        await asyncio.sleep(5)
+                        limited = True
                     continue
+                if errs.pop(m["slug"], 0):
+                    log.info("book reads working again for %s", m["slug"])
                 t_in = now - m["start"]
                 self.db.execute("INSERT INTO snapshots VALUES(?,?,?,?,?,?,?,?,?,?)",
                                 (now, m["slug"], round(t_in, 2), book["bid"], book["bid_sz"], book["ask"],
@@ -654,6 +669,14 @@ class Runner:
                 log.info("health: %d live windows, %d book reads in last 5 min | paper P/L so far: %s",
                          len(live), rows, self._fmt_totals())
                 rows, last_health = 0, now
+            if limited:
+                log.warning("rate limited by Polymarket; pausing 3s")
+                await asyncio.sleep(3)
+          except asyncio.CancelledError:
+            raise
+          except Exception:
+            log.exception("poll loop error (continuing)")
+            await asyncio.sleep(1)
 
     async def settle(self):
         while True:
@@ -691,6 +714,28 @@ class Runner:
 
     def _fmt_totals(self):
         return "  ".join(f"{k} ${v:+.2f}" for k, v in sorted(self.totals.items())) or "(nothing settled yet)"
+
+
+# ------------------------------ watchdog ------------------------------
+HEARTBEAT = [time.time()]
+
+
+def start_watchdog(limit=90):
+    """If the main loop goes quiet for `limit` seconds, log where it's stuck and restart."""
+    main_id = threading.main_thread().ident
+
+    def run():
+        while True:
+            time.sleep(5)
+            quiet = time.time() - HEARTBEAT[0]
+            if quiet > limit:
+                frame = sys._current_frames().get(main_id)
+                stack = "".join(traceback.format_stack(frame)) if frame else "(no stack)"
+                log.error("main loop stuck for %.0fs - restarting. It was here:\n%s", quiet, stack)
+                time.sleep(1)
+                os._exit(1)
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 # ------------------------------ web report (for checking from a phone) ------------------------------
@@ -808,7 +853,13 @@ async def main():
     start_web()
     for ln in _capture(check).splitlines():
         log.info("check: %s", ln)
-    await asyncio.gather(r.discover(), r.fast_discover(), r.poll(), r.settle())
+    start_watchdog()
+    try:
+        await asyncio.gather(r.discover(), r.fast_discover(), r.poll(), r.settle())
+    except Exception:
+        log.exception("crashed - restarting")
+        time.sleep(1)
+        os._exit(1)
 
 
 def check():
