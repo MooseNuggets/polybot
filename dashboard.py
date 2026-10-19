@@ -134,7 +134,14 @@ def summary(db_path, mode="cautious", coin=None, start_balance=100.0, strategy_n
                 f"SELECT strategy, side, price, {col}, cancelled_at FROM paper_orders "
                 "WHERE slug = ? AND (mode IS NULL OR mode = ?)", (slug, mode)):
             orders[st][side] = {"price": price, "filled": filled is not None, "cancelled": canc is not None}
+        sig = None
+        try:
+            sig = db.execute("SELECT p_up, t_left, ts FROM closer_signals WHERE slug = ? ORDER BY ts DESC LIMIT 1",
+                             (slug,)).fetchone()
+        except sqlite3.OperationalError:
+            pass
         live.append({"coin": c, "slug": slug, "left": we - now, "elapsed": now - ws,
+                     "model_up": sig[0] if sig and now - sig[2] < 5 else None,
                      "up_bid": bid, "up_ask": ask,
                      "down_bid": (1 - ask) if ask is not None else None,
                      "down_ask": (1 - bid) if bid is not None else None,
@@ -155,8 +162,38 @@ def summary(db_path, mode="cautious", coin=None, start_balance=100.0, strategy_n
             "WHERE s.ask IS NOT NULL AND s.bid IS NOT NULL AND s.ts > ? GROUP BY m.coin", (now - 6 * 3600,)):
         spread[c] = avg
 
+    # ---------- model check: our odds vs the market's, ~30s before each close ----------
+    check = {"n": 0}
+    try:
+        pick = {}
+        q = ("SELECT s.slug, s.t_left, s.p_up, s.up_ask, s.down_ask, m.winner FROM closer_signals s "
+             "JOIN markets m ON m.slug = s.slug WHERE m.winner IN ('up','down') AND s.t_left BETWEEN 15 AND 45"
+             + (" AND m.coin = ?" if coin else ""))
+        for slug, tl, p, ua, da, w in db.execute(q, (coin,) if coin else ()):
+            if ua is None or da is None:
+                continue
+            if slug not in pick or abs(tl - 30) < abs(pick[slug][0] - 30):
+                pick[slug] = (tl, p, (ua + 1 - da) / 2, 1.0 if w == "up" else 0.0)
+        rows = list(pick.values())
+        if rows:
+            n = len(rows)
+            bm = sum((p - y) ** 2 for _, p, _, y in rows) / n
+            bk = sum((mk - y) ** 2 for _, _, mk, y in rows) / n
+            buckets = []
+            for lo, hi in ((0, .1), (.1, .3), (.3, .7), (.7, .9), (.9, 1.01)):
+                b = [r for r in rows if lo <= r[1] < hi]
+                if b:
+                    buckets.append({"range": f"{int(lo*100)}–{min(100,int(hi*100))}%", "n": len(b),
+                                    "model": sum(r[1] for r in b) / len(b),
+                                    "market": sum(r[2] for r in b) / len(b),
+                                    "actual": sum(r[3] for r in b) / len(b)})
+            check = {"n": n, "brier_model": bm, "brier_market": bk, "buckets": buckets}
+    except sqlite3.OperationalError:
+        pass
+
     db.close()
     return {
+        "check": check,
         "now": now, "mode": mode, "coin": coin, "start": start_balance,
         "status": {"age": (now - last) if last else None, "hours": ((last - first) / 3600) if last else 0,
                    "book_reads": nsnap, "settled": settled[0] or 0, "up_wins": settled[1] or 0},
@@ -229,10 +266,14 @@ svg{display:block;width:100%;height:auto}
 
   <h2>Strategies</h2>
   <div class="card scroll"><table class="tbl" id="strats"></table></div>
-  <div class="note">Both = Up and Down both filled (locked profit). One = only one side filled (a straight bet). Each order is $1.</div>
+  <div class="note">Each bet is $1, at most one per window, in the last 2 minutes. Windows = windows where it bet.</div>
 
   <h2>Live markets</h2>
   <div class="mk" id="live"></div>
+
+  <h2>Model check</h2>
+  <div class="card" id="check"></div>
+  <div class="note">Compares our odds with the market's, 30 seconds before each close. Score = average squared error (lower is better). If the model's score isn't lower than the market's, there's no edge.</div>
 
   <h2>Recent windows</h2>
   <div class="card scroll"><table class="tbl" id="recent"></table></div>
@@ -317,8 +358,8 @@ function render(d) {
     tile("Drawdown", (a.drawdown * 100).toFixed(1) + "%", a.drawdown > 0.1 ? "neg" : "") +
     tile("Cash", money(a.cash), "", "equity minus open orders") +
     tile("Win rate", pct(a.win_rate), "", "windows with a profit") +
-    tile("Windows traded", a.windows.toLocaleString(), "", s.settled ? `Up won ${pct(s.up_wins / s.settled)}` : "waiting for first result") +
-    tile("Both sides filled", pct(a.both), "", `one side only ${pct(a.one)}`)
+    tile("Bets placed", a.windows.toLocaleString(), "", s.settled ? `Up won ${pct(s.up_wins / s.settled)}` : "waiting for first result") +
+    tile("Avg profit per bet", a.windows ? smoney(a.pnl / a.windows) : "–", cls(a.pnl), "after fees")
   ) : "";
 
   chart(d.equity, st.map(x => x.name));
@@ -330,18 +371,31 @@ function render(d) {
   $("live").innerHTML = d.live.length ? d.live.map(m => {
     const sp = (m.up_ask != null && m.up_bid != null) ? m.up_ask - m.up_bid : null;
     const dots = Object.entries(m.orders).map(([n, o]) => {
-      const f = (o.up && o.up.filled ? "U" : "") + (o.down && o.down.filled ? "D" : "");
-      return `<span class="dot ${f ? 'f' : ''}">${n.replace("maker_", "").replace("taker_both", "taker")} ${f || "–"}</span>`;
+      const f = (o.up && o.up.filled ? "UP" : "") + (o.down && o.down.filled ? "DOWN" : "");
+      if (!f) return "";
+      const px = (o.up && o.up.filled ? o.up.price : o.down.price);
+      return `<span class="dot f">${n} bought ${f} @ ${c2(px)}</span>`;
     }).join("");
     return `<div class="tile"><div class="k">${m.coin.toUpperCase()} · ${mmss(m.left)} left</div>
       <div class="bar"><b style="width:${Math.min(100, m.elapsed / 9)}%"></b></div>
       <div class="v"><span class="pos">↑ ${c2(m.up_ask)}</span> <span class="neg">↓ ${c2(m.down_ask)}</span></div>
-      <div class="s">cost to buy both ${m.up_ask != null && m.down_ask != null ? "$" + (m.up_ask + m.down_ask).toFixed(2) : "–"} · spread ${c2(sp)}</div>
-      <div class="dots">${dots || '<span class="dot">orders go in at the next window</span>'}</div></div>`;
+      <div class="s">${m.model_up != null ? `model says Up <b>${(m.model_up*100).toFixed(0)}%</b> · market ${c2(m.up_ask)}` : (m.left > 120 ? `model starts with 2:00 left` : `model warming up`)}</div>
+      <div class="dots">${dots || '<span class="dot">no bet this window yet</span>'}</div></div>`;
   }).join("") : `<div class="tile mut">No live 15-minute windows right now.</div>`;
 
+  const ck = d.check || {n: 0};
+  $("check").innerHTML = ck.n ? `
+    <div class="tiles" style="margin-bottom:12px">
+      ${tile("Model score", ck.brier_model.toFixed(4), ck.brier_model < ck.brier_market ? "pos" : "neg")}
+      ${tile("Market score", ck.brier_market.toFixed(4))}
+    </div>
+    <div class="scroll"><table class="tbl"><tr><th>Model said Up</th><th>Windows</th><th>Model avg</th><th>Market avg</th><th>Actually Up</th></tr>
+    ${ck.buckets.map(b => `<tr><td>${b.range}</td><td>${b.n}</td><td>${pct(b.model)}</td><td>${pct(b.market)}</td><td>${pct(b.actual)}</td></tr>`).join("")}
+    </table></div><div class="note">${ck.n} windows checked</div>`
+    : `<div class="mut" style="padding:10px">Fills in after the first windows close (the model needs ~45 min of price history first).</div>`;
+
   const names = st.map(x => x.name);
-  $("recent").innerHTML = `<tr><th>Window</th><th>Result</th>${names.map(n => `<th>${n.replace("follow_hedge","hedge").replace("simple_49","49")}</th>`).join("")}</tr>` +
+  $("recent").innerHTML = `<tr><th>Window</th><th>Result</th>${names.map(n => `<th>${n.replace("closer_strict","strict")}</th>`).join("")}</tr>` +
     (d.recent.length ? d.recent.map(r => `<tr><td>${r.coin.toUpperCase()} ${fmtT(r.end - 900)}</td><td><span class="pill ${r.winner}">${r.winner.toUpperCase()}</span></td>${names.map(n => { const p = r.pnl[n]; return `<td class="${p ? cls(p.pnl) : 'mut'}">${p && p.fills ? smoney(p.pnl) : "–"}</td>`; }).join("")}</tr>`).join("")
                      : `<tr><td colspan="9" class="mut">Nothing settled yet.</td></tr>`);
 }

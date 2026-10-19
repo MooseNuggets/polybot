@@ -46,24 +46,18 @@ ENTRY_SECONDS = 180       # paper orders can go in during the first 3 minutes of
 #   cancel: seconds into the window when any unfilled order is cancelled
 #   kind:   "maker" = resting limit orders, "taker" = buy both instantly at window open
 STRATEGIES = [
-    # Reference: rest a 49c bid on Up AND Down at window open; cancel unfilled at 12:00.
-    {"name": "simple_49", "kind": "maker", "bid": 0.49, "cancel": 720},
-
-    # FOLLOW + HEDGE: keep both bids 2c under the live price, re-adjusting every second.
-    # Once one side fills at p, the other side's bid moves to the best price that still locks
-    # in a profit (1 - p - 1c). It also buys the other side outright (taker fee) as soon as
-    # the pair costs no more than $1.02 in total, capping one-sided losses.
-    {"name": "follow_hedge", "kind": "follow", "edge": 0.02, "cancel": 720, "hedge": 0.02},
-
-    # OPTIMIZED (no laddering - only one pair working at a time):
-    #   band:      only start a pair while the market is between 35/65 and 65/35. A lopsided
-    #              market means the cheap side is probably losing, so we wait it out.
-    #   new_until: never start a new pair after 10:00 into the window (late fills are the
-    #              most one-sided); a pair already half done keeps working until 14:00.
-    #   pairs:     after a pair completes (profit locked), start a fresh one, up to 5 per window.
-    {"name": "optimized", "kind": "follow", "edge": 0.02, "cancel": 840, "new_until": 600,
-     "band": (0.35, 0.65), "pairs": 5, "hedge": 0.02},
+    # CLOSING-MINUTE: in the last 2 minutes of each window, work out the real odds of Up from
+    # the live coin price (the result is the AVERAGE price over the final 60 seconds, so much of
+    # it is already known), and buy whichever side the market is pricing too cheaply.
+    # One $1 bet per window at most. Skips the window if there's no clear edge.
+    #   edge: minimum gap (after fees) between our odds and the market price, in dollars per share
+    {"name": "closer", "kind": "closer", "edge": 0.03},
+    {"name": "closer_strict", "kind": "closer", "edge": 0.06},
 ]
+CLOSER_FROM = 120         # start looking this many seconds before the window closes
+CLOSER_UNTIL = 5          # stop this many seconds before the close (orders need time to land)
+VOL_MULT = 1.25           # widen the volatility estimate for safety (crypto has sudden jumps)
+COINBASE = {"btc": "BTC-USD", "eth": "ETH-USD", "sol": "SOL-USD", "xrp": "XRP-USD"}
 LOCK_PROFIT = 0.01        # follow: minimum profit per share pair it aims to lock after the first fill
 
 # Fees (Polymarket US fee schedule): fee = theta * contracts * p * (1 - p), rounded to the cent.
@@ -96,6 +90,11 @@ CREATE TABLE IF NOT EXISTS paper_orders (
 );
 CREATE INDEX IF NOT EXISTS idx_snap_slug ON snapshots(slug);
 CREATE INDEX IF NOT EXISTS idx_po_slug ON paper_orders(slug);
+CREATE TABLE IF NOT EXISTS closer_signals (
+    ts REAL, slug TEXT, coin TEXT, t_left REAL, spot REAL, basis REAL, sigma REAL,
+    ptb REAL, est_close REAL, est_sd REAL, p_up REAL, up_ask REAL, down_ask REAL, action TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sig_slug ON closer_signals(slug);
 """
 
 
@@ -433,6 +432,8 @@ class PaperBook:
     def place_window(self, m, book):
         orders = []
         for s in STRATEGIES:
+            if s["kind"] == "closer":
+                continue
             cash = strategy_cash(self.db, s["name"])
             if cash < 2 * ORDER_USD + 0.10:
                 log.info("%s skipped %s: only $%.2f paper cash left", s["name"], m["slug"], cash)
@@ -555,6 +556,143 @@ def window_pnl(db, slug, winner, mode="cautious"):
 
 
 # ------------------------------ main loops ------------------------------
+# ------------------------------ closing-minute strategy ------------------------------
+def read_spot(coin):
+    """Live coin price from Coinbase (one of the exchanges in the index Polymarket settles on)."""
+    req = urllib.request.Request(f"https://api.exchange.coinbase.com/products/{COINBASE[coin]}/ticker",
+                                 headers={"User-Agent": "polylog/2.0", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=4) as r:
+        return float(json.loads(r.read())["price"])
+
+
+def norm_cdf(x):
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def close_distribution(t_left, spot, observed_avg, observed_n, sigma):
+    """
+    The close is the average of 60 one-second index prices in the last minute.
+    Returns (expected close, standard deviation), treating the price as a random walk
+    with `sigma` dollars of movement per second.
+      t_left > 60: none of the average is known yet
+      t_left <= 60: `observed_n` of the 60 seconds are already in (average `observed_avg`)
+    """
+    r = max(0.0, t_left)
+    if r > 60:
+        a = r - 60
+        var = sigma ** 2 * (a + (60 * 61 * 121 / 6) / 3600.0)
+        return spot, math.sqrt(var)
+    k = max(0, min(60, observed_n))
+    rem = 60 - k
+    known = observed_avg * k if k else 0.0
+    mean = (known + spot * rem) / 60.0
+    var = sigma ** 2 * (rem * (rem + 1) * (2 * rem + 1) / 6.0) / 3600.0
+    return mean, math.sqrt(var)
+
+
+class PriceFeed:
+    def __init__(self):
+        self.hist = {c: collections.deque(maxlen=1500) for c in COINBASE}   # (ts, price)
+        self.basis = {c: collections.deque(maxlen=24) for c in COINBASE}    # index - coinbase, per window open
+        self.basis_done = set()
+
+    def latest(self, coin):
+        h = self.hist[coin]
+        return h[-1] if h else (None, None)
+
+    def avg_between(self, coin, t0, t1):
+        xs = [p for t, p in self.hist[coin] if t0 <= t < t1]
+        return (sum(xs) / len(xs), len(xs)) if xs else (None, 0)
+
+    def sigma(self, coin, lookback=900):
+        h = [x for x in self.hist[coin] if x[0] >= time.time() - lookback]
+        if len(h) < 120:
+            return None
+        rets = []
+        for (t0, p0), (t1, p1) in zip(h, h[1:]):
+            dt = t1 - t0
+            if 0.5 <= dt <= 3:
+                rets.append((p1 - p0) / math.sqrt(dt))
+        if len(rets) < 100:
+            return None
+        mu = sum(rets) / len(rets)
+        return math.sqrt(sum((x - mu) ** 2 for x in rets) / (len(rets) - 1)) * VOL_MULT
+
+    def basis_est(self, coin, spot):
+        b = sorted(self.basis[coin])
+        if len(b) < 3:
+            return 0.0, spot * 0.0005            # unknown yet: assume none, but be very unsure
+        med = b[len(b) // 2]
+        mad = sorted(abs(x - med) for x in b)[len(b) // 2]
+        return med, max(1.4826 * mad, spot * 0.00005)
+
+    def learn_basis(self, m):
+        """At each window open we know the index average (price to beat) - compare to Coinbase."""
+        if m["slug"] in self.basis_done or not m.get("ptb"):
+            return
+        avg, n = self.avg_between(m["coin"], m["start"] - 60, m["start"])
+        if n >= 40:
+            self.basis[m["coin"]].append(m["ptb"] - avg)
+            self.basis_done.add(m["slug"])
+
+
+class Closer:
+    def __init__(self, db, feed):
+        self.db, self.feed = db, feed
+        self.bet = set()              # (strategy, slug) already bet
+        self.ptb_checked = {}
+
+    def step(self, m, book, now):
+        t_left = m["end"] - now
+        if not (CLOSER_UNTIL <= t_left <= CLOSER_FROM):
+            return
+        coin = m["coin"]
+        ts, spot = self.feed.latest(coin)
+        sigma = self.feed.sigma(coin)
+        if spot is None or now - ts > 3 or not sigma or not m.get("ptb"):
+            return
+        if len(self.feed.basis[coin]) < 3:
+            return                    # still learning the Coinbase-vs-index gap; odds would be guesswork
+        basis, basis_sd = self.feed.basis_est(coin, spot)
+        obs_avg, obs_n = self.feed.avg_between(coin, m["end"] - 60, now)
+        if t_left <= 60 and obs_n < (60 - t_left) * 0.7:
+            return                    # missing too much of the averaging minute to trust it
+        mean, sd = close_distribution(t_left, spot, obs_avg or spot, obs_n if t_left <= 60 else 0, sigma)
+        mean += basis
+        sd = math.sqrt(sd ** 2 + basis_sd ** 2)
+        p_up = 1 - norm_cdf((m["ptb"] - mean) / sd) if sd > 0 else (1.0 if mean >= m["ptb"] else 0.0)
+        p_up = min(max(p_up, 0.001), 0.999)
+        up_ask = book["ask"]
+        down_ask = None if book["bid"] is None else round(1 - book["bid"], 4)
+        actions = []
+        for st in STRATEGIES:
+            if st["kind"] != "closer" or (st["name"], m["slug"]) in self.bet:
+                continue
+            best = None
+            for side, ask, p, depth in (("up", up_ask, p_up, book["ask_sz"]),
+                                        ("down", down_ask, 1 - p_up, book["bid_sz"])):
+                if ask is None or ask <= 0 or ask >= 1:
+                    continue
+                edge = p - ask - TAKER_THETA * ask * (1 - ask)
+                if edge >= st["edge"] and (depth or 0) >= ORDER_USD / ask and (best is None or edge > best[2]):
+                    best = (side, ask, edge)
+            if best and strategy_cash(self.db, st["name"]) >= ORDER_USD + 0.05:
+                side, ask, edge = best
+                shares = ORDER_USD / ask
+                self.db.execute(
+                    "INSERT INTO paper_orders(strategy,slug,coin,side,price,usd,shares,fee,placed_at,"
+                    "filled_cautious,filled_hopeful) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (st["name"], m["slug"], coin, side, ask, ORDER_USD, shares,
+                     fee(TAKER_THETA, shares, ask), now, now, now))
+                self.bet.add((st["name"], m["slug"]))
+                actions.append(f"{st['name']}:{side}@{ask:.2f}")
+                log.info("%s BUY %s %s at %.2f | model %.0f%% Up, %.0fs left, edge %.1fc",
+                         st["name"], coin.upper(), side.upper(), ask, p_up * 100, t_left, edge * 100)
+        self.db.execute("INSERT INTO closer_signals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (now, m["slug"], coin, round(t_left, 1), spot, basis, sigma, m["ptb"],
+                         mean, sd, p_up, up_ask, down_ask, ",".join(actions) or None))
+
+
 class Runner:
     def __init__(self, db):
         self.db = db
@@ -564,6 +702,9 @@ class Runner:
         self.placed = set()
         self.totals = {}
         self.known = {}        # coin -> most recent market seen (used to guess the next window's name)
+        self.feed = PriceFeed()
+        self.closer = Closer(db, self.feed)
+        self.ptb_try = {}
 
     def _track(self, m):
         now = time.time()
@@ -662,6 +803,10 @@ class Runner:
                 elif m["slug"] in self.placed:
                     self.paper.update(m, book, self.prev.get(m["slug"]), t_in)
                 self.prev[m["slug"]] = book
+                try:
+                    self.closer.step(m, book, now)
+                except Exception:
+                    log.exception("closer error on %s", m["slug"])
             if now - last_commit > 5:
                 self.db.commit()
                 last_commit = now
@@ -677,6 +822,35 @@ class Runner:
           except Exception:
             log.exception("poll loop error (continuing)")
             await asyncio.sleep(1)
+
+    async def prices(self):
+        """Coin prices once a second, plus the 'price to beat' for each live window."""
+        errs = 0
+        while True:
+            await asyncio.sleep(1 - (time.time() % 1))
+            now = time.time()
+            res = await asyncio.gather(*(asyncio.wait_for(asyncio.to_thread(read_spot, c), 4) for c in COINS),
+                                       return_exceptions=True)
+            for c, p in zip(COINS, res):
+                if isinstance(p, BaseException):
+                    errs += 1
+                    if errs in (1, 10) or errs % 300 == 0:
+                        log.warning("coin price read failed for %s (%d errors so far): %r", c, errs, p)
+                    continue
+                self.feed.hist[c].append((now, p))
+            for m in list(self.markets.values()):
+                if m["start"] <= now <= m["end"]:
+                    if not m.get("ptb") and now - m["start"] > 3 and now - self.ptb_try.get(m["slug"], 0) > 10:
+                        self.ptb_try[m["slug"]] = now
+                        try:
+                            fresh = await asyncio.to_thread(lookup_slug, m["slug"])
+                            if fresh and fresh.get("ptb"):
+                                m["ptb"] = fresh["ptb"]
+                                self.db.execute("UPDATE markets SET price_to_beat=? WHERE slug=?", (m["ptb"], m["slug"]))
+                        except Exception as e:
+                            log.warning("price-to-beat lookup failed for %s: %r", m["slug"], e)
+                    if now - m["start"] > 2:
+                        self.feed.learn_basis(m)
 
     async def settle(self):
         while True:
@@ -855,7 +1029,7 @@ async def main():
         log.info("check: %s", ln)
     start_watchdog()
     try:
-        await asyncio.gather(r.discover(), r.fast_discover(), r.poll(), r.settle())
+        await asyncio.gather(r.discover(), r.fast_discover(), r.poll(), r.settle(), r.prices())
     except Exception:
         log.exception("crashed - restarting")
         time.sleep(1)

@@ -4,21 +4,25 @@ Watches the 15-minute **Up or Down** markets for **BTC, ETH, SOL and XRP** on Po
 logs every order book once a second, and paper trades "bid both sides" strategies at **$1 per order**.
 No account, no API key, no real money. Each strategy has its own **$100 paper account** and stops trading if it runs out.
 
-## What it paper trades (every window, every coin)
+## What it paper trades: the closing-minute strategy
 
-| Strategy    | What it does |
-|-------------|--------------|
-| simple_49    | Simple reference: rests a $1 buy on Up AND Down at 49¢ at window open, cancels at 12:00 |
-| follow_hedge | Keeps both bids 2¢ under the live price; after one side fills, works the other side to lock a profit, or buys it outright once the pair costs ≤ $1.02 (caps losses) |
-| optimized    | follow_hedge, optimized: only enters when the market is between 35/65 and 65/35, no new pairs after 10:00, and repeats up to 5 pairs per window. Never more than one pair working at a time (no laddering) |
+Each 15-minute window settles on the **average** coin price over its final 60 seconds. So near the
+close, much of the result is already known. In the last 2 minutes of every window the bot:
 
-If both sides fill at 48¢ you hold 2.08 Up + 2.08 Down shares for $2.00, and one side pays $2.08: +$0.08.
-If only one side fills, you're holding a straight bet that can win or lose.
+1. Reads the live coin price from Coinbase every second (corrected for the small gap to the
+   CF Benchmarks index Polymarket settles on, which it learns at each window open).
+2. Works out the real odds of Up from how far the price is from the open, how much of the
+   averaging minute is already in, and how much the coin usually moves per second.
+3. Buys $1 of whichever side the market prices too cheaply, if the gap after fees is big enough.
+   At most one bet per window. Most windows it doesn't bet.
 
-Each fill is scored two ways: **cautious** (price traded *through* your order) and **hopeful**
-(price *touched* your order). Real results land in between.
+| Account       | Minimum edge to bet |
+|---------------|---------------------|
+| closer        | 3¢ per share after fees |
+| closer_strict | 6¢ per share after fees |
 
-To change prices, the cancel time, or the $1 size, edit the SETTINGS block at the top of `logger.py`.
+The **Model check** on the dashboard compares the model's odds with the market's own prices
+30 seconds before each close. If the model's score isn't lower than the market's, there's no edge.
 
 ## Setup on Railway (easiest from a phone)
 
