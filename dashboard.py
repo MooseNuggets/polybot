@@ -65,6 +65,8 @@ def summary(db_path, mode="cautious", coin=None, start_balance=100.0, strategy_n
             "roi": (s["pnl"] / s["spent"]) if s["spent"] else None,
             "win_rate": (s["wins"] / traded) if traded else None,
         })
+    if strategy_names:
+        strategies = [s for s in strategies if s["name"] in set(strategy_names)]
     have = {s["name"] for s in strategies}
     for n in strategy_names:
         if n not in have:

@@ -8,15 +8,9 @@ No account, no API key, no real money. Each strategy has its own **$100 paper ac
 
 | Strategy    | What it does |
 |-------------|--------------|
-| maker_49    | Rests a $1 buy on Up at 49¢ AND a $1 buy on Down at 49¢ at window open. Cancels anything unfilled at 12:00. |
-| maker_48    | Same at 48¢ |
-| maker_46    | Same at 46¢ |
-| maker_44    | Same at 44¢ |
-| taker_both  | Baseline: instantly buys $1 of Up and $1 of Down at window open, paying the taker fee |
-| follow_1    | Keeps both bids 1¢ under the live price, re-adjusting every second. After one side fills, moves the other bid to the best price that still locks in at least 1¢ profit per pair |
-| follow_2    | Same, 2¢ under the live price |
-| follow_2h   | follow_2 + hedge: after one side fills, instantly buys the other side (taker) once the pair costs ≤ $1.02 incl. fee, capping the loss |
-| maker_49h   | maker_49 + the same hedge |
+| maker_49    | Simple reference: rests a $1 buy on Up AND Down at 49¢ at window open, cancels at 12:00 |
+| follow_2h   | Keeps both bids 2¢ under the live price; after one side fills, works the other side to lock a profit, or buys it outright once the pair costs ≤ $1.02 (caps losses) |
+| follow_2hr  | follow_2h, optimized: only enters when the market is between 35/65 and 65/35, no new pairs after 10:00, and repeats up to 5 pairs per window. Never more than one pair working at a time (no laddering) |
 
 If both sides fill at 48¢ you hold 2.08 Up + 2.08 Down shares for $2.00, and one side pays $2.08: +$0.08.
 If only one side fills, you're holding a straight bet that can win or lose.

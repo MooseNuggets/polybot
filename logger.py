@@ -45,23 +45,23 @@ ENTRY_SECONDS = 60        # paper orders go in during the first minute of each w
 #   cancel: seconds into the window when any unfilled order is cancelled
 #   kind:   "maker" = resting limit orders, "taker" = buy both instantly at window open
 STRATEGIES = [
+    # Reference: rest a 49c bid on Up AND Down at window open; cancel unfilled at 12:00.
     {"name": "maker_49", "kind": "maker", "bid": 0.49, "cancel": 720},
-    {"name": "maker_48", "kind": "maker", "bid": 0.48, "cancel": 720},
-    {"name": "maker_46", "kind": "maker", "bid": 0.46, "cancel": 720},
-    {"name": "maker_44", "kind": "maker", "bid": 0.44, "cancel": 720},
-    {"name": "taker_both", "kind": "taker"},   # baseline: what instantly buying both costs
 
-    # FOLLOW: keep both bids a few cents under the live price and re-adjust every second.
-    # Once one side fills at p, the other side's bid moves to the best price that still
-    # locks in a profit (1 - p - 1 cent) and keeps following the market there.
-    {"name": "follow_1", "kind": "follow", "edge": 0.01, "cancel": 720},
-    {"name": "follow_2", "kind": "follow", "edge": 0.02, "cancel": 720},
-
-    # HEDGE: once one side fills, instantly buy the other side (paying the taker fee)
-    # as soon as the pair costs no more than $1.02 in total, i.e. a loss of at most 2 cents
-    # per share pair. Caps the damage when the price doesn't come back.
+    # FOLLOW + HEDGE: keep both bids 2c under the live price, re-adjusting every second.
+    # Once one side fills at p, the other side's bid moves to the best price that still locks
+    # in a profit (1 - p - 1c). It also buys the other side outright (taker fee) as soon as
+    # the pair costs no more than $1.02 in total, capping one-sided losses.
     {"name": "follow_2h", "kind": "follow", "edge": 0.02, "cancel": 720, "hedge": 0.02},
-    {"name": "maker_49h", "kind": "maker_hedge", "bid": 0.49, "cancel": 720, "hedge": 0.02},
+
+    # OPTIMIZED (no laddering - only one pair working at a time):
+    #   band:      only start a pair while the market is between 35/65 and 65/35. A lopsided
+    #              market means the cheap side is probably losing, so we wait it out.
+    #   new_until: never start a new pair after 10:00 into the window (late fills are the
+    #              most one-sided); a pair already half done keeps working until 14:00.
+    #   pairs:     after a pair completes (profit locked), start a fresh one, up to 5 per window.
+    {"name": "follow_2hr", "kind": "follow", "edge": 0.02, "cancel": 840, "new_until": 600,
+     "band": (0.35, 0.65), "pairs": 5, "hedge": 0.02},
 ]
 LOCK_PROFIT = 0.01        # follow: minimum profit per share pair it aims to lock after the first fill
 
@@ -263,20 +263,55 @@ def follow_quotes(book, edge):
     return {"up": up, "down": dn}
 
 
+def in_band(book, band):
+    if not band:
+        return True
+    if book["bid"] is None or book["ask"] is None:
+        return False
+    mid = (book["bid"] + book["ask"]) / 2
+    return band[0] <= mid <= band[1]
+
+
+def opening_prices(s, book):
+    """Prices for a new pair of bids, or None if this strategy shouldn't open one now."""
+    if not in_band(book, s.get("band")):
+        return None
+    if s["kind"] == "follow":
+        return follow_quotes(book, s["edge"])
+    prices = {}
+    for side in ("up", "down"):
+        p = s["bid"]
+        a = side_ask(book, side)
+        if a is not None and p >= a:
+            p = round(a - 0.01, 2)
+        if p > 0.01:
+            prices[side] = p
+    return prices if len(prices) == 2 else None
+
+
 class DynSim:
     """
-    One strategy whose behaviour depends on what has filled (follow / hedge).
+    One strategy whose behaviour depends on what has filled (follow / hedge / repeat).
+    Only ONE pair (one Up bid + one Down bid) is ever working at a time - no laddering.
     Because fills differ between the cautious and hopeful views, each view runs as its own
     simulation, and its orders are tagged with that mode.
     """
 
-    def __init__(self, db, s, m, mode, prices):
+    def __init__(self, db, s, m, mode, prices=None):
         self.db, self.s, self.m, self.mode = db, s, m, mode
         self.legs = {}
         self.first = None
+        self.pairs = 0
         self.done = False
-        for side, p in prices.items():
-            self.legs[side] = self._insert(side, p, ORDER_USD / p, MAKER_THETA, filled=False)
+        self.max_pairs = s.get("pairs", 1)
+        self.new_until = s.get("new_until", s["cancel"])
+        if prices:
+            self._open(prices)
+
+    def _open(self, prices):
+        self.first = None
+        self.legs = {side: self._insert(side, p, ORDER_USD / p, MAKER_THETA, filled=False)
+                     for side, p in prices.items()}
 
     def _insert(self, side, p, shares, theta, filled):
         now = time.time()
@@ -302,18 +337,36 @@ class DynSim:
         self.db.execute("UPDATE paper_orders SET filled_cautious=?, filled_hopeful=? WHERE id=?",
                         (now, now, self.legs[side]["id"]))
 
-    def finish(self, now):
+    def _cancel_open_legs(self, now):
         for leg in self.legs.values():
             if not leg["filled"]:
                 self.db.execute("UPDATE paper_orders SET cancelled_at=? WHERE id=? AND cancelled_at IS NULL",
                                 (now, leg["id"]))
+
+    def finish(self, now):
+        self._cancel_open_legs(now)
         self.done = True
+
+    def _pair_complete(self, t_in):
+        self.pairs += 1
+        self.legs, self.first = {}, None
+        if self.pairs >= self.max_pairs or t_in >= self.new_until:
+            self.done = True
 
     def step(self, book, last, t_in, now):
         if self.done:
             return
         if t_in >= self.s["cancel"]:
             self.finish(now)
+            return
+        # 0. no pair working: open one if conditions allow
+        if not self.legs:
+            if t_in >= self.new_until:
+                self.done = True
+                return
+            prices = opening_prices(self.s, book)
+            if prices and (self.pairs == 0 or strategy_cash(self.db, self.s["name"]) >= 2 * ORDER_USD + 0.10):
+                self._open(prices)
             return
         # 1. did anything fill at the prices we were showing?
         for side, leg in self.legs.items():
@@ -322,10 +375,17 @@ class DynSim:
                 if self.first is None:
                     self.first = side
         if all(l["filled"] for l in self.legs.values()):
-            self.done = True
+            self._pair_complete(t_in)
             return
-        # 2. nothing filled yet: follow keeps both bids tracking the market
+        # 2. nothing filled yet
         if self.first is None:
+            if t_in >= self.new_until or (self.s.get("band") and not in_band(book, self.s["band"])):
+                # too late, or market has gone lopsided: pull both bids (may reopen later)
+                self._cancel_open_legs(now)
+                self.legs = {}
+                if t_in >= self.new_until:
+                    self.done = True
+                return
             if self.s["kind"] == "follow":
                 q = follow_quotes(book, self.s["edge"])
                 if q:
@@ -346,7 +406,7 @@ class DynSim:
                                 "filled_cautious=?, filled_hopeful=? WHERE id=?",
                                 (ask, shares, shares * ask, fee(TAKER_THETA, shares, ask), now, now, leg["id"]))
                 leg.update(price=ask, shares=shares, filled=True)
-                self.done = True
+                self._pair_complete(t_in)
                 return
         if self.s["kind"] == "follow":
             target = cents_down(1 - p_first - LOCK_PROFIT)
@@ -393,18 +453,9 @@ class PaperBook:
                 for side, p in (("up", book["ask"]), ("down", round(1 - book["bid"], 4))):
                     orders.append(self._new(s, m, side, p, TAKER_THETA, filled=True))
             elif s["kind"] in ("follow", "maker_hedge"):
-                if s["kind"] == "follow":
-                    prices = follow_quotes(book, s["edge"])
-                else:
-                    prices = {}
-                    for side in ("up", "down"):
-                        p = s["bid"]
-                        a = side_ask(book, side)
-                        if a is not None and p >= a:
-                            p = round(a - 0.01, 2)
-                        if p > 0.01:
-                            prices[side] = p
-                if not prices or len(prices) < 2:
+                prices = opening_prices(s, book)
+                waits = bool(s.get("band")) or s.get("pairs", 1) > 1
+                if not prices and not waits:
                     continue
                 for mode in ("cautious", "hopeful"):
                     self.dyn.setdefault(m["slug"], []).append(DynSim(self.db, s, m, mode, prices))
