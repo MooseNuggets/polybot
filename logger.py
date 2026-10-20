@@ -54,10 +54,12 @@ STRATEGIES = [
     #   min_price / min_prob: FAVORITES ONLY - only buy a side the market already prices at 70c+
     #   and our model puts at 85%+. (Betting on cheap long shots lost money: the market was right.)
     #   usd: size of each bet
+    {"name": "closer", "kind": "closer", "usd": 1.0, "edge": 0.03, "min_price": 0.70, "min_prob": 0.85},
+    {"name": "closer_strict", "kind": "closer", "usd": 1.0, "edge": 0.05, "min_price": 0.80, "min_prob": 0.95},
     {"name": "closer_5", "kind": "closer", "usd": 5.0, "edge": 0.03, "min_price": 0.70, "min_prob": 0.85},
     {"name": "closer_strict_5", "kind": "closer", "usd": 5.0, "edge": 0.05, "min_price": 0.80, "min_prob": 0.95},
 ]
-BOT_LABEL = "$5 BETS"     # shown next to the title on the dashboard
+BOT_LABEL = ""            # optional tag shown next to the title on the dashboard
 CLOSER_FROM = 120         # start looking this many seconds before the window closes
 CLOSER_UNTIL = 5          # stop this many seconds before the close (orders need time to land)
 VOL_MULT = 1.25           # widen the volatility estimate for safety (crypto has sudden jumps)

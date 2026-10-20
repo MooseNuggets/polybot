@@ -16,10 +16,12 @@ close, much of the result is already known. In the last 2 minutes of every windo
 3. Buys $1 of whichever side the market prices too cheaply, if the gap after fees is big enough.
    At most one bet per window. Most windows it doesn't bet.
 
-| Account       | Minimum edge to bet |
-|---------------|---------------------|
-| closer        | Favorites only: market price 70¢+, model 85%+, edge 3¢+ after fees |
-| closer_strict | Favorites only: market price 80¢+, model 95%+, edge 5¢+ after fees |
+| Account         | Rule |
+|-----------------|------|
+| closer          | $1 bets. Favorites only: market price 70¢+, model 85%+, edge 3¢+ after fees |
+| closer_strict   | $1 bets. Favorites only: market price 80¢+, model 95%+, edge 5¢+ after fees |
+| closer_5        | Same as closer, $5 bets |
+| closer_strict_5 | Same as closer_strict, $5 bets |
 
 The **Model check** on the dashboard compares the model's odds with the market's own prices
 30 seconds before each close. If the model's score isn't lower than the market's, there's no edge.
