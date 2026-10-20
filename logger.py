@@ -53,9 +53,11 @@ STRATEGIES = [
     #   edge: minimum gap (after fees) between our odds and the market price, in dollars per share
     #   min_price / min_prob: FAVORITES ONLY - only buy a side the market already prices at 70c+
     #   and our model puts at 85%+. (Betting on cheap long shots lost money: the market was right.)
-    {"name": "closer", "kind": "closer", "edge": 0.03, "min_price": 0.70, "min_prob": 0.85},
-    {"name": "closer_strict", "kind": "closer", "edge": 0.05, "min_price": 0.80, "min_prob": 0.95},
+    #   usd: size of each bet
+    {"name": "closer_5", "kind": "closer", "usd": 5.0, "edge": 0.03, "min_price": 0.70, "min_prob": 0.85},
+    {"name": "closer_strict_5", "kind": "closer", "usd": 5.0, "edge": 0.05, "min_price": 0.80, "min_prob": 0.95},
 ]
+BOT_LABEL = "$5 BETS"     # shown next to the title on the dashboard
 CLOSER_FROM = 120         # start looking this many seconds before the window closes
 CLOSER_UNTIL = 5          # stop this many seconds before the close (orders need time to land)
 VOL_MULT = 1.25           # widen the volatility estimate for safety (crypto has sudden jumps)
@@ -678,20 +680,21 @@ class Closer:
                 if ask < st.get("min_price", 0) or p < st.get("min_prob", 0):
                     continue          # favorites only
                 edge = p - ask - TAKER_THETA * ask * (1 - ask)
-                if edge >= st["edge"] and (depth or 0) >= ORDER_USD / ask and (best is None or edge > best[2]):
+                if edge >= st["edge"] and (depth or 0) >= st.get("usd", ORDER_USD) / ask and (best is None or edge > best[2]):
                     best = (side, ask, edge)
-            if best and strategy_cash(self.db, st["name"]) >= ORDER_USD + 0.05:
+            usd = st.get("usd", ORDER_USD)
+            if best and strategy_cash(self.db, st["name"]) >= usd + 0.10:
                 side, ask, edge = best
-                shares = ORDER_USD / ask
+                shares = usd / ask
                 self.db.execute(
                     "INSERT INTO paper_orders(strategy,slug,coin,side,price,usd,shares,fee,placed_at,"
                     "filled_cautious,filled_hopeful) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (st["name"], m["slug"], coin, side, ask, ORDER_USD, shares,
+                    (st["name"], m["slug"], coin, side, ask, usd, shares,
                      fee(TAKER_THETA, shares, ask), now, now, now))
                 self.bet.add((st["name"], m["slug"]))
                 actions.append(f"{st['name']}:{side}@{ask:.2f}")
-                log.info("%s BUY %s %s at %.2f | model %.0f%% Up, %.0fs left, edge %.1fc",
-                         st["name"], coin.upper(), side.upper(), ask, p_up * 100, t_left, edge * 100)
+                log.info("%s BUY $%.0f %s %s at %.2f | model %.0f%% Up, %.0fs left, edge %.1fc",
+                         st["name"], usd, coin.upper(), side.upper(), ask, p_up * 100, t_left, edge * 100)
         self.db.execute("INSERT INTO closer_signals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (now, m["slug"], coin, round(t_left, 1), spot, basis, sigma, m["ptb"],
                          mean, sd, p_up, up_ask, down_ask, ",".join(actions) or None))
@@ -980,6 +983,7 @@ def start_web():
                     else:
                         data = dashboard.summary(DB_PATH, q.get("mode", ["cautious"])[0], q.get("coin", [""])[0],
                                                      STARTING_BALANCE, [x["name"] for x in STRATEGIES])
+                        data["label"] = BOT_LABEL
                         out, ctype = json.dumps(data, default=list).encode(), "application/json"
                     self.send_response(200)
                 except Exception as e:
@@ -1027,7 +1031,7 @@ async def main():
         pass
     r = Runner(db)
     log.info("Polymarket US 15-min logger + paper trader | coins: %s | $%.2f per order",
-             ",".join(COINS), ORDER_USD)
+             ",".join(COINS), max(st.get("usd", ORDER_USD) for st in STRATEGIES))
     start_web()
     for ln in _capture(check).splitlines():
         log.info("check: %s", ln)

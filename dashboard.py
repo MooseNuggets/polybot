@@ -250,7 +250,7 @@ svg{display:block;width:100%;height:auto}
 .err{background:#3a1a1d;color:var(--red);padding:12px;border-radius:12px;margin-top:14px;display:none}
 </style></head>
 <body><div class="wrap">
-  <h1>Polybot <span class="badge">PAPER</span></h1>
+  <h1>Polybot <span class="badge">PAPER</span> <span class="badge" id="label" style="display:none"></span></h1>
   <div class="sub" id="sub">Loading…</div>
   <div class="err" id="err"></div>
 
@@ -266,7 +266,7 @@ svg{display:block;width:100%;height:auto}
 
   <h2>Strategies</h2>
   <div class="card scroll"><table class="tbl" id="strats"></table></div>
-  <div class="note">Each bet is $1, at most one per window, in the last 2 minutes. Windows = windows where it bet.</div>
+  <div class="note">At most one bet per window, in the last 2 minutes. Windows = windows where it bet.</div>
 
   <h2>Live markets</h2>
   <div class="mk" id="live"></div>
@@ -347,6 +347,7 @@ function render(d) {
   $("sub").innerHTML = `Updated ${new Date(d.now*1000).toLocaleTimeString()} · ${ok ? '<span class="pos">● running</span>' : '<span class="neg">● stalled</span>'} · ${s.hours.toFixed(1)}h of data`;
   const st = d.strategies;
   START = d.start;
+  if (d.label) { $("label").textContent = d.label; $("label").style.display = ""; }
   if (!st.find(x => x.name === pick)) pick = st.length ? st[0].name : "";
   $("strs").innerHTML = st.map(x => `<button class="btn ${x.name===pick?'on':''}" data-s="${x.name}">${x.name}</button>`).join("");
   document.querySelectorAll("[data-s]").forEach(b => b.onclick = () => { pick = b.dataset.s; render(last); });
