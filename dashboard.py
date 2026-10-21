@@ -247,12 +247,20 @@ svg{display:block;width:100%;height:auto}
 .pill{font-size:12px;font-weight:600;padding:2px 8px;border-radius:999px}
 .pill.up{background:#163a2b;color:var(--grn)}.pill.down{background:#3a1a1d;color:var(--red)}
 .note{color:var(--mut);font-size:13px;margin-top:10px}
+.live{border-radius:16px;padding:16px 18px;margin-top:16px;border:1px solid var(--line);background:var(--card)}
+.live.on{border-color:#2f7d5b}.live.dry{border-color:#8a6d2a}.live.bad{border-color:#7d2f33}
+.live h3{margin:0 0 4px;font-size:16px;display:flex;align-items:center;gap:8px}
+.lv{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
+.lv div b{display:block;font-size:20px;margin-top:2px}
+.lv div span{color:var(--mut);font-size:13px}
+.btn.red{border-color:#7d2f33;color:var(--red)}.btn.grn{border-color:#2f7d5b;color:var(--grn)}
 .err{background:#3a1a1d;color:var(--red);padding:12px;border-radius:12px;margin-top:14px;display:none}
 </style></head>
 <body><div class="wrap">
   <h1>Polybot <span class="badge">PAPER</span> <span class="badge" id="label" style="display:none"></span></h1>
   <div class="sub" id="sub">Loading…</div>
   <div class="err" id="err"></div>
+  <div id="livebox"></div>
 
   <div class="row" id="coins"></div>
   <div class="row" id="modes"></div>
@@ -341,7 +349,42 @@ function chart(eq, names) {
   $("legend").innerHTML = names.map((n, i) => `<span><i style="background:${COLORS[i%COLORS.length]}"></i>${n} <b class="${cls(eq.series[n].at(-1) - START)}">${money(eq.series[n].at(-1))}</b></span>`).join("");
 }
 
+function liveBox(L) {
+  const el = $("livebox");
+  if (!L) { el.innerHTML = ""; return; }
+  const bal = L.balance != null ? money(L.balance) : "–";
+  const chg = (L.balance != null && L.start_balance != null) ? L.balance - L.start_balance : null;
+  const rows = (L.recent || []).filter(r => r.mode === L.mode || L.mode === "stopped").slice(0, 6).map(r => {
+    const what = r.mode === "dry-run" ? "would buy" : (r.filled ? "bought" : (r.state === "SKIPPED" ? "skipped" : "missed"));
+    const res = r.pnl != null ? `<span class="${cls(r.pnl)}">${smoney(r.pnl)}</span>` : (r.filled ? "open" : "");
+    return `<tr><td>${fmtT(r.ts)} ${r.coin.toUpperCase()} ${r.side.toUpperCase()}</td><td>${what} @ ${c2(r.filled ? r.cost : r.seen)}</td><td>${res}</td></tr>`;
+  }).join("");
+  const table = rows ? `<div class="scroll" style="margin-top:12px"><table class="tbl">${rows}</table></div>` : "";
+  const copies = `copies <b>${L.bots.join(", ")}</b> · $${L.usd} per bet`;
+  if (L.mode === "off") {
+    el.innerHTML = `<div class="live"><h3>Live trading: off</h3><div class="mut">Add PM_KEY_ID and PM_SECRET in Railway Variables to connect your account.</div></div>`;
+  } else if (L.mode === "error") {
+    el.innerHTML = `<div class="live bad"><h3><span class="neg">●</span> Live trading: key problem</h3><div class="mut">${L.auth_error || "Could not use the API keys."}</div></div>`;
+  } else if (L.mode === "dry-run") {
+    el.innerHTML = `<div class="live dry"><h3><span style="color:#f5b84a">●</span> Live trading: DRY-RUN</h3>
+      <div class="mut">Keys work. ${copies}. Not sending orders - set LIVE_ENABLED = 1 in Railway Variables to go live.</div>
+      <div class="lv"><div><span>Account balance</span><b>${bal}</b></div><div><span>Would-be bets</span><b>${(L.recent||[]).filter(r=>r.mode==="dry-run").length}</b></div></div>${table}</div>`;
+  } else {
+    const on = L.mode === "live";
+    el.innerHTML = `<div class="live ${on ? "on" : "bad"}"><h3><span class="${on ? "pos" : "neg"}">●</span> ${on ? "LIVE - real money" : "Live trading STOPPED"}</h3>
+      <div class="mut">${on ? copies + ` · stops after -$${L.loss_limit}/day or ${L.max_bets} bets/day` : (L.stopped_reason || "")}</div>
+      <div class="lv">
+        <div><span>Account balance</span><b>${bal}</b>${chg != null ? `<span class="${cls(chg)}">${smoney(chg)} since start</span>` : ""}</div>
+        <div><span>Live P/L (settled)</span><b class="${cls(L.pnl)}">${smoney(L.pnl)}</b><span>today ${smoney(L.today_pnl)}</span></div>
+        <div><span>Orders filled</span><b>${L.filled} / ${L.sent}</b><span>fill-or-kill at the seen price</span></div>
+        <div><span>Win rate</span><b>${L.settled ? pct(L.wins / L.settled) : "–"}</b><span>fees $${(L.fees||0).toFixed(2)}</span></div>
+      </div>${table}
+      <div class="row" style="margin:14px 0 0">${on ? `<a class="btn red" href="/live/stop?${k}">Stop live trading</a>` : `<a class="btn grn" href="/live/start?${k}">Resume live trading</a>`}</div></div>`;
+  }
+}
+
 function render(d) {
+  liveBox(d.live);
   const s = d.status;
   const ok = s.age != null && s.age < 60;
   $("sub").innerHTML = `Updated ${new Date(d.now*1000).toLocaleTimeString()} · ${ok ? '<span class="pos">● running</span>' : '<span class="neg">● stalled</span>'} · ${s.hours.toFixed(1)}h of data`;

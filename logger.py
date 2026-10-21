@@ -19,6 +19,7 @@ import html
 import http.server
 import io
 import json
+import live
 import math
 import threading
 import traceback
@@ -697,6 +698,8 @@ class Closer:
                      fee(TAKER_THETA, shares, ask), now, now, now))
                 self.bet.add((st["name"], m["slug"]))
                 actions.append(f"{st['name']}:{side}@{ask:.2f}")
+                if LIVE is not None:
+                    LIVE.submit(st["name"], m, side, ask, t_left, p_up if side == "up" else 1 - p_up)
                 log.info("%s BUY $%.0f %s %s at %.2f | model %.0f%% Up, %.0fs left, edge %.1fc",
                          st["name"], usd, coin.upper(), side.upper(), ask, p_up * 100, t_left, edge * 100)
         self.db.execute("INSERT INTO closer_signals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -901,6 +904,9 @@ class Runner:
         return "  ".join(f"{k} ${v:+.2f}" for k, v in sorted(self.totals.items())) or "(nothing settled yet)"
 
 
+LIVE = None   # set in main(): live.LiveTrader
+
+
 # ------------------------------ watchdog ------------------------------
 HEARTBEAT = [time.time()]
 
@@ -988,6 +994,7 @@ def start_web():
                         data = dashboard.summary(DB_PATH, q.get("mode", ["cautious"])[0], q.get("coin", [""])[0],
                                                      STARTING_BALANCE, [x["name"] for x in STRATEGIES])
                         data["label"] = BOT_LABEL
+                        data["live"] = LIVE.snapshot() if LIVE is not None else None
                         out, ctype = json.dumps(data, default=list).encode(), "application/json"
                     self.send_response(200)
                 except Exception as e:
@@ -997,6 +1004,15 @@ def start_web():
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(out)
+                return
+            if u.path in ("/live/stop", "/live/start") and LIVE is not None:
+                if u.path == "/live/stop":
+                    LIVE.stop()
+                else:
+                    LIVE.resume()
+                self.send_response(303)
+                self.send_header("Location", f"/?x=1{k}")
+                self.end_headers()
                 return
             if u.path == "/log":
                 body = "\n".join(reversed(RECENT_LOG)) or "(no log lines yet)"
@@ -1033,6 +1049,10 @@ async def main():
         db.execute("ALTER TABLE paper_orders ADD COLUMN mode TEXT")
     except sqlite3.OperationalError:
         pass
+    db.commit()
+    global LIVE
+    LIVE = live.LiveTrader(DB_PATH)
+    log.info("live trading mode: %s (copies: %s, $%.2f per bet)", LIVE.mode(), ",".join(LIVE.bots), LIVE.usd)
     r = Runner(db)
     log.info("Polymarket US 15-min logger + paper trader | coins: %s | $%.2f per order",
              ",".join(COINS), max(st.get("usd", ORDER_USD) for st in STRATEGIES))

@@ -28,6 +28,23 @@ close, much of the result is already known. In the last 2 minutes of every windo
 The **Model check** on the dashboard compares the model's odds with the market's own prices
 30 seconds before each close. If the model's score isn't lower than the market's, there's no edge.
 
+## Live trading (real money)
+
+Set these in Railway → your service → **Variables**. Never put keys in GitHub or in chat.
+
+| Variable | What it does |
+|---|---|
+| `PM_KEY_ID` | Your Polymarket US API Key ID |
+| `PM_SECRET` | Your Polymarket US API Secret Key |
+| `LIVE_ENABLED` | Leave unset (or 0) for **dry-run**: checks the keys, shows your balance, logs the bets it *would* place. Set to `1` to send real orders. |
+| `LIVE_BOTS` | Which paper bot to copy (default `closer`) |
+| `LIVE_USD` | Dollars per real bet (default `1`) |
+| `LIVE_DAILY_LOSS_LIMIT` | Stops for the day after this loss (default `10`) |
+| `LIVE_MAX_BETS_PER_DAY` | Stops for the day after this many bets (default `40`) |
+
+Real orders are fill-or-kill at the exact price the paper bot saw: all or nothing, never worse.
+The dashboard's **Stop live trading** button halts it instantly.
+
 ## Setup on Railway (easiest from a phone)
 
 1. Go to **railway.com**, sign in with GitHub, and pick the **Hobby** plan (~$5/month).
