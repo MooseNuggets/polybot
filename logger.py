@@ -58,6 +58,8 @@ STRATEGIES = [
     {"name": "closer_strict", "kind": "closer", "usd": 1.0, "edge": 0.05, "min_price": 0.80, "min_prob": 0.95},
     {"name": "closer_5", "kind": "closer", "usd": 5.0, "edge": 0.03, "min_price": 0.70, "min_prob": 0.85},
     {"name": "closer_strict_5", "kind": "closer", "usd": 5.0, "edge": 0.05, "min_price": 0.80, "min_prob": 0.95},
+    {"name": "closer_10", "kind": "closer", "usd": 10.0, "edge": 0.03, "min_price": 0.70, "min_prob": 0.85},
+    {"name": "closer_strict_10", "kind": "closer", "usd": 10.0, "edge": 0.05, "min_price": 0.80, "min_prob": 0.95},
 ]
 BOT_LABEL = ""            # optional tag shown next to the title on the dashboard
 CLOSER_FROM = 120         # start looking this many seconds before the window closes
