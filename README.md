@@ -57,35 +57,43 @@ The dashboard's **Stop live trading** button halts it instantly.
 The page has buttons for the report, each coin, the last 24 hours, the live log, and a market check.
 Every time new code is pushed to GitHub, Railway redeploys automatically.
 
-## Alternative: setup on a DigitalOcean server
+## Backup option: run it on a DigitalOcean server instead of Railway
 
-**1. Put these files on GitHub**
-- github.com → New repository → name it `polybot` → Create
-- "uploading an existing file" → drag in `logger.py`, `analyze.py`, `setup.sh`, `README.md`
-- Click **Commit changes** (uploading alone does nothing)
+Everything works the same (dashboard, paper bots, live trading). Your history is stored on the
+server's own disk, so updates never wipe it. About 15 minutes, all doable from a phone.
 
-**2. Rent a small server**
-- DigitalOcean (or Hetzner/Vultr) → Create Droplet → **Ubuntu 24.04**, cheapest plan (~$4–6/month), any US region
-- When it's ready, open the droplet and click **Console** (a terminal in your browser, no setup needed)
+**1. Make a GitHub access token** (the repo is private, so the server needs a read-only key)
+- github.com → profile photo → **Settings → Developer settings → Personal access tokens →
+  Fine-grained tokens → Generate new token**
+- Repository access: **Only select repositories → polybot**. Permissions: **Contents → Read-only**
+- Generate and copy it (starts with `github_pat_`). It's only shown once.
 
-**3. Install (paste one line into the console, swap in your GitHub username)**
+**2. Create the server**
+- digitalocean.com → **Create → Droplets** → Region: any US → Image: **Ubuntu 24.04** →
+  Size: Basic / Regular, cheapest (~$6/month) → Authentication: **Password** (make one up)
+- **Create Droplet**, wait for the green dot, then open it and tap **Console**
+
+**3. Install** - paste this one line, with your token in place of `TOKEN`:
 ```
-git clone https://github.com/YOUR-USERNAME/polybot && cd polybot && sudo bash setup.sh
+git clone https://MooseNuggets:TOKEN@github.com/MooseNuggets/polybot && cd polybot && sudo bash setup.sh
 ```
-It installs, starts the logger, and prints a market check. **Copy that check output back to Claude**
-so it can confirm everything is being read correctly.
+It asks a few questions. Press Enter to accept the value in [brackets]:
+- **Dashboard password** - make one up
+- **API Key ID / Secret Key** - from polymarket.us/developer (the secret is hidden as you type).
+  Press Enter to skip both for paper-only.
+- **Send REAL orders?** - `0` = dry-run first (recommended), `1` = live
+- bet size, daily loss limit, daily bet cap - Enter keeps the defaults ($1, $10, 40)
 
-The logger now runs 24/7 and restarts itself after reboots or crashes.
+At the end it prints your dashboard link: `http://SERVER-IP/?key=YOUR-PASSWORD`
 
-## Daily use (in the droplet Console)
+**Later, in the droplet Console:**
 
 | To… | Paste |
 |-----|-------|
-| See the paper trading report | `cd ~/polybot && venv/bin/python analyze.py` |
-| Report for one coin | `cd ~/polybot && venv/bin/python analyze.py --coin btc` |
-| Last 24 hours only | `cd ~/polybot && venv/bin/python analyze.py --hours 24` |
-| Watch it live | `journalctl -u polylog -f` (Ctrl+C to stop watching) |
-| Is it running? | `systemctl status polylog` |
-| Install an update from GitHub | `cd ~/polybot && git pull && sudo systemctl restart polylog` |
+| Change any setting (e.g. turn live on) | `cd ~/polybot && sudo bash setup.sh` |
+| Install updates from GitHub | `cd ~/polybot && git pull && sudo systemctl restart polylog` |
+| Watch the live log | `journalctl -u polylog -f` (Ctrl+C to stop) |
+| Stop the bot completely | `sudo systemctl stop polylog` |
 
-Let it run **at least 3–5 days** before reading much into the numbers.
+Don't run Railway and DigitalOcean with live trading on at the same time, or every real bet is placed twice.
+
