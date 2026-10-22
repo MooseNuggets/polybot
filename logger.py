@@ -1117,7 +1117,7 @@ async def main():
     log.info("Polymarket US 15-min logger + paper trader | coins: %s | $%.2f per order",
              ",".join(COINS), max(st.get("usd", ORDER_USD) for st in STRATEGIES))
     start_web()
-    for ln in _capture(check).splitlines():
+    for ln in _capture(check, False).splitlines():
         log.info("check: %s", ln)
     start_watchdog()
     try:
@@ -1128,14 +1128,14 @@ async def main():
         os._exit(1)
 
 
-def check():
+def check(verbose=True):
     """One-shot sanity check: are we finding markets and reading books?"""
     print("Looking up 15-minute Up/Down markets on Polymarket US...")
     raw = http_json("/v1/markets", {"categories": "crypto", "closed": "false", "limit": 200})
     mk = raw.get("markets", [])
     print(f"  crypto markets returned: {len(mk)}")
     sample = [x for x in mk if x.get("assetPriceTerms")][:1]
-    if sample:
+    if sample and verbose:
         print("  example market (raw):")
         print("   ", json.dumps({k: sample[0].get(k) for k in ("slug", "assetPriceTerms", "marketSides")})[:1500])
     found = find_markets()
@@ -1149,7 +1149,8 @@ def check():
         b = read_book(cur[0]["slug"])
         print(f"  book for {cur[0]['slug']}: Up bid {b['bid']} / Up ask {b['ask']}  "
               f"-> Down ask {None if b['bid'] is None else round(1 - b['bid'], 4)}  (last {b['last']}, state {b['state']})")
-        print("  raw book:", json.dumps(http_json(f"/v1/markets/{urllib.parse.quote(cur[0]['slug'])}/book"))[:1500])
+        if verbose:
+            print("  raw book:", json.dumps(http_json(f"/v1/markets/{urllib.parse.quote(cur[0]['slug'])}/book"))[:1500])
     print("Done. If every coin shows open windows, the logger is ready.")
 
 

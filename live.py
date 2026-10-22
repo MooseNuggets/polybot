@@ -10,8 +10,8 @@ Which bots trade for real, and the master ON/OFF switch, are set from the dashbo
 saved in the database. Each live bot bets its own paper size ($1 / $5 / $10).
 While the master switch is OFF, selected bots log the orders they *would* send (dry-run).
 
-Orders are FILL-OR-KILL limit orders at the exact price the bot saw: they fill completely at
-that price or not at all. Prices on Polymarket US are always quoted in Up ("YES") terms, so
+Orders are IMMEDIATE-OR-CANCEL limit orders at the exact price the bot saw: whatever is
+available at that price or better fills instantly, the rest is cancelled. Never a worse price. Prices on Polymarket US are always quoted in Up ("YES") terms, so
 buying Down at 0.93 is sent as BUY_SHORT with price 0.07. If that convention were ever wrong,
 the order could only fail to fill - it can't buy at a worse price.
 """
@@ -321,11 +321,8 @@ class LiveTrader:
             "type": "ORDER_TYPE_LIMIT",
             "price": {"value": f"{yes_px:.2f}", "currency": "USD"},
             "quantity": qty,
-            "tif": "TIME_IN_FORCE_FILL_OR_KILL",
-            "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
-            "synchronousExecution": True,
-            "maxBlockTime": "3",
-        }
+            "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+        }   # same fields as Polymarket's own example order - nothing optional
         t0 = time.time()
         try:
             resp = self._req("POST", "/v1/orders", body)
@@ -337,17 +334,32 @@ class LiveTrader:
         latency = (time.time() - t0) * 1000
         oid = resp.get("id")
         filled, avg, comm, state, err = 0.0, None, 0.0, None, None
+        ex_sh = ex_val = 0.0
         for ex in resp.get("executions") or []:
-            if ex.get("orderRejectReason"):
-                err = str(ex.get("orderRejectReason"))
+            if ex.get("orderRejectReason") and "UNSPECIFIED" not in str(ex.get("orderRejectReason")):
+                err = str(ex.get("orderRejectReason")).replace("ORD_REJECT_REASON_", "rejected: ")
+            sh, px = _f(ex.get("lastShares")) or 0.0, _f(ex.get("lastPx"))
+            if sh > 0 and px is not None:
+                ex_sh += sh
+                ex_val += sh * px
         try:
-            o = (self._req("GET", f"/v1/order/{oid}") or {}).get("order", {}) if oid else {}
+            o = {}
+            for wait in (0.3, 0.7, 1.5):          # IOC settles almost instantly; check a few times
+                time.sleep(wait)
+                o = (self._req("GET", f"/v1/order/{oid}") or {}).get("order", {}) if oid else {}
+                if o.get("state") not in ("ORDER_STATE_NEW", "ORDER_STATE_PENDING_NEW", "ORDER_STATE_PENDING_RISK"):
+                    break
             state = o.get("state")
             filled = _f(o.get("cumQuantity")) or 0.0
             avg = _f(o.get("avgPx"))
             comm = _f(o.get("commissionNotionalTotalCollected")) or 0.0
         except Exception as e:
-            err = (err + " | " if err else "") + f"status check failed: {e}"
+            if "HTTP 404" not in str(e):      # rejected orders aren't kept, so 404 is expected then
+                err = (err + " | " if err else "") + f"status check failed: {e}"
+        if not filled and ex_sh > 0:          # fall back to the fills reported with the order
+            filled, avg = ex_sh, ex_val / ex_sh
+        if state is None:
+            state = "ORDER_STATE_REJECTED" if err else ("ORDER_STATE_FILLED" if filled else "UNKNOWN")
         cost = None
         if filled and avg is not None:
             if side == "up":
@@ -381,6 +393,10 @@ class LiveTrader:
                 if item:
                     if time.time() - item[0] > 10:
                         log.warning("live bet dropped: signal is %ds old", time.time() - item[0])
+                        ts, strategy, slug, coin, side, price, t_left, p_model, usd = item
+                        self._record(ts=ts, strategy=strategy, slug=slug, coin=coin, side=side,
+                                     seen_price=price, usd=usd, qty=0, t_left=t_left, p_model=p_model,
+                                     mode="live", state="DROPPED", filled_qty=0, error="too slow (signal >10s old)")
                         continue
                     self._place(*item)
             except Exception:

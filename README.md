@@ -37,7 +37,7 @@ The **Model check** on the dashboard compares the model's odds with the market's
    - Tap **Turn live trading ON** to start real orders. It asks you to confirm and lists what will be bet.
    - Each live bot bets its own size ($1 / $5 / $10). Tap **Turn live trading OFF** to stop instantly.
 
-Real orders are fill-or-kill at the exact price the bot saw: all or nothing, never worse.
+Real orders are immediate-or-cancel at the exact price the bot saw: whatever's available at that price or better fills instantly, the rest is cancelled. Never a worse price.
 Daily safety limits (set during setup): stop after a $10 loss or 40 bets per day.
 The dashboard is served over **https** (`https://YOUR-IP-WITH-DASHES.sslip.io`) so the password
 and switches are encrypted.

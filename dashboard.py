@@ -384,10 +384,11 @@ function liveBox(L, d) {
       <td>${pb.bets ? `<span class="${cls(pb.pnl)}">${smoney(pb.pnl)}</span>` : "–"}<br><span class="mut">live ${pb.bets || 0} bets</span></td>
       <td><button class="sw ${sel ? (on ? "sw-live" : "sw-on") : ""}" data-bot="${n}">${sel ? (on ? "LIVE" : "ON") : "OFF"}</button></td></tr>`;
   }).join("");
-  const recent = (L.recent || []).slice(0, 8).map(r => {
-    const what = r.mode === "dry-run" ? "would buy" : (r.filled ? "bought" : (r.state === "SKIPPED" ? "skipped" : "missed"));
+  const recent = (L.recent || []).slice(0, 12).map(r => {
+    const what = r.mode === "dry-run" ? "would buy" : (r.filled ? "bought" : (r.state === "SKIPPED" ? "skipped" : (r.state === "DROPPED" ? "dropped" : (r.error && r.error.startsWith("rejected") ? "rejected" : "missed"))));
+    const why = !r.filled && r.mode !== "dry-run" ? (r.error || (r.state === "ORDER_STATE_CANCELED" ? "price moved before it arrived" : (r.state || ""))) : "";
     const res = r.pnl != null ? `<span class="${cls(r.pnl)}">${smoney(r.pnl)}</span>` : (r.filled ? "open" : "");
-    return `<tr><td>${fmtT(r.ts)} ${r.coin.toUpperCase()} ${r.side.toUpperCase()}<br><span class="mut">${r.bot || ""}</span></td><td>${what} @ ${c2(r.filled ? r.cost : r.seen)}</td><td>${res}</td></tr>`;
+    return `<tr><td>${fmtT(r.ts)} ${r.coin.toUpperCase()} ${r.side.toUpperCase()}<br><span class="mut">${r.bot || ""}</span></td><td>${what} @ ${c2(r.filled ? r.cost : r.seen)}${why ? `<br><span class="mut" style="white-space:normal">${why.replace(/</g, "&lt;").slice(0, 90)}</span>` : ""}</td><td>${res}</td></tr>`;
   }).join("");
   el.innerHTML = `<div class="live ${on ? "on" : "dry"}">
     <h3><span class="${on ? "pos" : ""}" style="${on ? "" : "color:#f5b84a"}">●</span> ${on ? "LIVE TRADING ON - real money" : "Live trading OFF"}</h3>
