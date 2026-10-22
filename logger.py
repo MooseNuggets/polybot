@@ -985,6 +985,10 @@ def start_web():
                 try:
                     n = int(self.headers.get("Content-Length") or 0)
                     body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+                    if "settings" in body:
+                        LIVE.save_settings(body["settings"])
+                    if body.get("end_cooldown"):
+                        LIVE.end_cooldown()
                     LIVE.set_control(armed=body.get("armed"), bots=body.get("bots"))
                     code, out = 200, LIVE.snapshot()
                 except Exception as e:

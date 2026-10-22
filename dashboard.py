@@ -255,6 +255,12 @@ svg{display:block;width:100%;height:auto}
 .lv div span{color:var(--mut);font-size:13px}
 .sw{min-width:64px;padding:8px 10px;border-radius:999px;border:1px solid var(--line);background:var(--chip);color:var(--mut);font-weight:700;font-size:13px;cursor:pointer}
 .sw-on{background:#2a2410;border-color:#8a6d2a;color:#f5b84a}.sw-live{background:#163a2b;border-color:#2f7d5b;color:var(--grn)}
+.cool{margin-top:12px;padding:12px 14px;border-radius:12px;background:#2a2410;border:1px solid #8a6d2a;color:#f5d38a}
+details.risk{margin-top:14px;border-top:1px solid var(--line);padding-top:12px}
+details.risk summary{cursor:pointer;color:var(--txt);font-weight:600}
+.form{display:grid;gap:10px;margin-top:10px}
+.form label{display:flex;flex-direction:column;gap:4px;color:var(--mut);font-size:13px}
+.form input{background:var(--chip);border:1px solid var(--line);color:var(--txt);border-radius:10px;padding:10px;font-size:16px}
 .btn.red{border-color:#7d2f33;color:var(--red)}.btn.grn{border-color:#2f7d5b;color:var(--grn)}
 .err{background:#3a1a1d;color:var(--red);padding:12px;border-radius:12px;margin-top:14px;display:none}
 </style></head>
@@ -353,6 +359,8 @@ function chart(eq, names) {
 
 function liveBox(L, d) {
   const el = $("livebox");
+  const a = document.activeElement;
+  if (a && a.closest && a.closest("#livebox details.risk")) return;   // don't redraw while editing limits
   if (!L) { el.innerHTML = ""; return; }
   if (L.mode === "off") {
     el.innerHTML = `<div class="live"><h3>Live trading: not connected</h3><div class="mut">No Polymarket API keys on the server. Re-run setup to add them.</div></div>`;
@@ -363,6 +371,8 @@ function liveBox(L, d) {
     return;
   }
   const on = L.armed;
+  const S = L.settings || {}, SL = L.setting_labels || {};
+  const cd = on && L.cooldown_until && L.cooldown_until * 1000 > Date.now();
   const bal = L.balance != null ? money(L.balance) : "–";
   const chg = (L.balance != null && L.start_balance != null) ? L.balance - L.start_balance : null;
   const paper = Object.fromEntries((d.strategies || []).map(s => [s.name, s]));
@@ -381,23 +391,37 @@ function liveBox(L, d) {
   }).join("");
   el.innerHTML = `<div class="live ${on ? "on" : "dry"}">
     <h3><span class="${on ? "pos" : ""}" style="${on ? "" : "color:#f5b84a"}">●</span> ${on ? "LIVE TRADING ON - real money" : "Live trading OFF"}</h3>
-    <div class="mut">${on ? "Selected bots place real bets." : "Selected bots only log the bets they would place."} Stops for the day after -$${L.loss_limit} or ${L.max_bets} bets.</div>
+    <div class="mut">${on ? "Selected bots place real bets." : "Selected bots only log the bets they would place."} Safety limits below.</div>
+    ${cd ? `<div class="cool"><b>⏸ Cooling down until ${fmtT(L.cooldown_until)}</b><br>${L.cooldown_reason}. No real bets until then.<div class="row" style="margin:10px 0 0"><button class="btn" id="resume">Resume now</button></div></div>` : ""}
     <div class="row" style="margin:14px 0 4px"><button class="btn ${on ? "red" : "grn"}" id="master">${on ? "Turn live trading OFF" : "Turn live trading ON"}</button></div>
     <div class="lv">
       <div><span>Account balance</span><b>${bal}</b>${chg != null ? `<span class="${cls(chg)}">${smoney(chg)} since start</span>` : ""}</div>
       <div><span>Live P/L (settled)</span><b class="${cls(L.pnl)}">${smoney(L.pnl)}</b><span>today ${smoney(L.today_pnl)} · ${L.filled}/${L.sent} filled</span></div>
     </div>
     <div class="scroll" style="margin-top:12px"><table class="tbl">${rows}</table></div>
+    <details class="risk"${window.__riskOpen ? " open" : ""}><summary>Safety limits</summary>
+      <div class="form">${Object.keys(SL).map(k => `<label>${SL[k]}<input type="number" inputmode="decimal" min="0" step="any" id="set_${k}" value="${S[k]}"></label>`).join("")}</div>
+      <div class="row" style="margin:10px 0 0"><button class="btn grn" id="saveset">Save limits</button></div>
+      <div class="note">Limits apply to real-money bets only. Cooldowns count losses in a row (or $ lost in the last hour) across all live bots, then pause real betting for the set time.</div>
+    </details>
     ${recent ? `<div class="mut" style="margin-top:14px">Recent</div><div class="scroll"><table class="tbl">${recent}</table></div>` : ""}
   </div>`;
   $("master").onclick = async () => {
     if (!on) {
       if (!L.bots.length) { alert("Switch at least one bot ON first."); return; }
       const list = L.bots.map(n => `  ${n}: $${L.sizes[n]} per bet`).join("\n");
-      if (!confirm(`Start REAL-MONEY trading?\n\n${list}\n\nStops for the day after -$${L.loss_limit} or ${L.max_bets} bets.`)) return;
+      if (!confirm(`Start REAL-MONEY trading?\n\n${list}\n\nStops for the day after -$${S.loss_limit} or ${S.max_bets} bets. Cooldown after ${S.cd_losses || "-"} losses in a row.`)) return;
     }
     await setLive({armed: !on});
   };
+  const det = el.querySelector("details.risk");
+  if (det) det.ontoggle = () => { window.__riskOpen = det.open; };
+  $("saveset").onclick = async () => {
+    const settings = {};
+    for (const k of Object.keys(SL)) settings[k] = $("set_" + k).value;
+    await setLive({settings}); alert("Limits saved.");
+  };
+  if ($("resume")) $("resume").onclick = async () => { if (confirm("End the cooldown and allow real bets again now?")) await setLive({end_cooldown: true}); };
   document.querySelectorAll("[data-bot]").forEach(b => b.onclick = async () => {
     const n = b.dataset.bot, sel = L.bots.includes(n);
     if (!sel && on && !confirm(`${n} will start placing REAL $${L.sizes[n]} bets right away. Continue?`)) return;

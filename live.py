@@ -59,8 +59,8 @@ class LiveTrader:
         self.key_id = os.environ.get("PM_KEY_ID", "").strip()
         secret = os.environ.get("PM_SECRET", "").strip()
         self.sizes = {st["name"]: float(st.get("usd", 1.0)) for st in strategies}
-        self.loss_limit = float(os.environ.get("LIVE_DAILY_LOSS_LIMIT", "10") or 10)
-        self.max_bets = int(os.environ.get("LIVE_MAX_BETS_PER_DAY", "40") or 40)
+        self.env_loss_limit = float(os.environ.get("LIVE_DAILY_LOSS_LIMIT", "10") or 10)
+        self.env_max_bets = int(os.environ.get("LIVE_MAX_BETS_PER_DAY", "40") or 40)
         self.key = None
         self.key_error = None
         if self.key_id and secret:
@@ -170,7 +170,7 @@ class LiveTrader:
         with self.lock:
             return self.db.execute("""
                 SELECT l.ts, l.strategy, l.slug, l.coin, l.side, l.filled_qty, l.cost_px, l.commission,
-                       m.winner, l.mode, l.state, l.seen_price, l.usd, l.error, l.latency_ms
+                       m.winner, l.mode, l.state, l.seen_price, l.usd, l.error, l.latency_ms, m.settled_at
                 FROM live_orders l LEFT JOIN markets m ON m.slug = l.slug
                 WHERE l.ts >= ? ORDER BY l.ts""", (since,)).fetchall()
 
@@ -181,14 +181,97 @@ class LiveTrader:
             return None
         return filled * ((1.0 if side == winner else 0.0) - cost) - comm
 
+    # ---------------- risk settings (editable from the dashboard) ----------------
+    SETTINGS = {   # name: (type, min, max, label)
+        "loss_limit": (float, 0, 100000, "Daily loss limit ($)"),
+        "max_bets":   (int,   0, 10000,  "Daily bet cap"),
+        "cd_losses":  (int,   0, 100,    "Losses in a row before cooldown (0 = off)"),
+        "cd_dollars": (float, 0, 100000, "$ lost within 1 hour before cooldown (0 = off)"),
+        "cd_minutes": (int,   1, 10080,  "Cooldown length (minutes)"),
+    }
+
+    def settings(self):
+        defaults = {"loss_limit": self.env_loss_limit, "max_bets": self.env_max_bets,
+                    "cd_losses": 3, "cd_dollars": 0, "cd_minutes": 60}
+        out = {}
+        for k, (typ, lo, hi, _) in self.SETTINGS.items():
+            v = self._get("set_" + k)
+            try:
+                out[k] = typ(float(v)) if v not in (None, "") else defaults[k]
+            except ValueError:
+                out[k] = defaults[k]
+        return out
+
+    def save_settings(self, new):
+        clean = {}
+        for k, v in (new or {}).items():
+            if k not in self.SETTINGS:
+                raise ValueError(f"unknown setting: {k}")
+            typ, lo, hi, label = self.SETTINGS[k]
+            try:
+                v = typ(float(v))
+            except (TypeError, ValueError):
+                raise ValueError(f"{label}: not a number")
+            if not lo <= v <= hi:
+                raise ValueError(f"{label}: must be between {lo} and {hi}")
+            clean[k] = v
+        for k, v in clean.items():
+            self._set("set_" + k, v)
+        if clean:
+            log.warning("risk settings changed: %s", ", ".join(f"{k}={v}" for k, v in clean.items()))
+
+    def end_cooldown(self):
+        self._set("cooldown_until", 0)
+        self._set("streak_since", time.time())
+        log.warning("cooldown ended from dashboard")
+
+    def cooldown(self, now=None):
+        """Returns (until_timestamp, reason) if trading is paused by a cooldown, else (0, '').
+        Starts a new cooldown when the streak or fast-loss trigger is hit."""
+        now = now or time.time()
+        until = float(self._get("cooldown_until", 0) or 0)
+        if until > now:
+            return until, self._get("cooldown_reason", "")
+        st = self.settings()
+        since = float(self._get("streak_since", 0) or 0)
+        settled = [(r, self._row_pnl(r)) for r in self._pnl_rows(since)
+                   if r[9] == "live" and (r[5] or 0) > 0 and r[8] is not None and (r[15] or 0) > since]
+        settled.sort(key=lambda x: x[0][15] or x[0][0])
+        reason = ""
+        if st["cd_losses"] > 0:
+            streak = 0
+            for _, p in reversed(settled):
+                if p is not None and p < 0:
+                    streak += 1
+                else:
+                    break
+            if streak >= st["cd_losses"]:
+                reason = f"{streak} losses in a row"
+        if not reason and st["cd_dollars"] > 0:
+            hour = sum(p for r, p in settled if p is not None and (r[15] or 0) >= now - 3600)
+            if hour <= -st["cd_dollars"]:
+                reason = f"lost ${-hour:.2f} in the last hour"
+        if reason:
+            until = now + st["cd_minutes"] * 60
+            self._set("cooldown_until", until)
+            self._set("cooldown_reason", reason)
+            self._set("streak_since", now)
+            log.warning("COOLDOWN for %d min: %s", st["cd_minutes"], reason)
+            return until, reason
+        return 0, ""
+
     def _guards_ok(self, usd):
+        st = self.settings()
+        until, why = self.cooldown()
+        if until:
+            return False, f"cooling down until {datetime.fromtimestamp(until).strftime('%H:%M')} ({why})"
         rows = [r for r in self._pnl_rows(self._today_start()) if r[9] == "live"]
         bets = sum(1 for r in rows if (r[5] or 0) > 0)
-        if bets >= self.max_bets:
+        if bets >= st["max_bets"]:
             return False, f"daily bet cap reached ({bets})"
         realized = sum(p for p in (self._row_pnl(r) for r in rows) if p is not None)
         open_risk = sum((r[5] or 0) * (r[6] or 0) for r in rows if (r[5] or 0) > 0 and r[8] is None)
-        if realized - open_risk <= -self.loss_limit:
+        if realized - open_risk <= -st["loss_limit"]:
             return False, f"daily loss limit hit (${realized:.2f} settled, ${open_risk:.2f} open)"
         if time.time() - self.balance_at > 300:
             self.refresh_balance()
@@ -307,6 +390,7 @@ class LiveTrader:
         settled = [(r, self._row_pnl(r)) for r in filled if r[8] is not None]
         today = self._today_start()
         start_bal = self._get("start_balance")
+        cd_until, cd_reason = self.cooldown() if self.armed() else (0, "")
         per_bot = {}
         for r, p in settled:
             b = per_bot.setdefault(r[1], {"pnl": 0.0, "bets": 0, "wins": 0})
@@ -322,7 +406,9 @@ class LiveTrader:
         return {
             "mode": self.mode(), "armed": self.armed(), "bots": self.live_bots(),
             "sizes": self.sizes, "per_bot": per_bot,
-            "loss_limit": self.loss_limit, "max_bets": self.max_bets,
+            "settings": self.settings(),
+            "setting_labels": {k: v[3] for k, v in self.SETTINGS.items()},
+            "cooldown_until": cd_until, "cooldown_reason": cd_reason,
             "auth_error": self.key_error or self.auth_error,
             "balance": self.balance, "buying_power": self.buying_power,
             "start_balance": float(start_bal) if start_bal else None,
