@@ -973,6 +973,29 @@ def start_web():
         def log_message(self, *a):
             pass
 
+        def do_POST(self):
+            u = urllib.parse.urlparse(self.path)
+            q = urllib.parse.parse_qs(u.query)
+            if key and q.get("key", [""])[0] != key:
+                self.send_response(403)
+                self.end_headers()
+                return
+            code, out = 404, {"error": "not found"}
+            if u.path == "/live/set" and LIVE is not None:
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                    body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+                    LIVE.set_control(armed=body.get("armed"), bots=body.get("bots"))
+                    code, out = 200, LIVE.snapshot()
+                except Exception as e:
+                    code, out = 400, {"error": str(e)}
+            b = json.dumps(out, default=list).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(b)
+
         def do_GET(self):
             u = urllib.parse.urlparse(self.path)
             q = urllib.parse.parse_qs(u.query)
@@ -1005,11 +1028,8 @@ def start_web():
                 self.end_headers()
                 self.wfile.write(out)
                 return
-            if u.path in ("/live/stop", "/live/start") and LIVE is not None:
-                if u.path == "/live/stop":
-                    LIVE.stop()
-                else:
-                    LIVE.resume()
+            if u.path == "/live/stop" and LIVE is not None:      # emergency OFF link
+                LIVE.stop()
                 self.send_response(303)
                 self.send_header("Location", f"/?x=1{k}")
                 self.end_headers()
@@ -1035,7 +1055,7 @@ def start_web():
             self.end_headers()
             self.wfile.write(out)
 
-    srv = http.server.ThreadingHTTPServer(("0.0.0.0", int(port)), H)
+    srv = http.server.ThreadingHTTPServer((os.environ.get("BIND", "0.0.0.0"), int(port)), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     log.info("report page listening on port %s", port)
 
@@ -1051,8 +1071,9 @@ async def main():
         pass
     db.commit()
     global LIVE
-    LIVE = live.LiveTrader(DB_PATH)
-    log.info("live trading mode: %s (copies: %s, $%.2f per bet)", LIVE.mode(), ",".join(LIVE.bots), LIVE.usd)
+    LIVE = live.LiveTrader(DB_PATH, STRATEGIES)
+    log.info("live trading: %s | live bots: %s", "ON" if LIVE.armed() else "off",
+             ", ".join(LIVE.live_bots()) or "none")
     r = Runner(db)
     log.info("Polymarket US 15-min logger + paper trader | coins: %s | $%.2f per order",
              ",".join(COINS), max(st.get("usd", ORDER_USD) for st in STRATEGIES))

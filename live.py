@@ -1,14 +1,14 @@
 """
 Live trading on Polymarket US: mirrors chosen paper bots with real orders.
 
-Everything is controlled by Railway Variables:
-  PM_KEY_ID              your API Key ID           (never put this in GitHub)
-  PM_SECRET              your API Secret Key       (never put this in GitHub)
-  LIVE_ENABLED           "1" to send real orders. Anything else = dry-run (logs what it would do)
-  LIVE_BOTS              which paper bot(s) to copy, comma separated      (default: closer)
-  LIVE_USD               dollars per real bet                              (default: 1)
-  LIVE_DAILY_LOSS_LIMIT  stop for the day after losing this much          (default: 10)
-  LIVE_MAX_BETS_PER_DAY  stop for the day after this many bets            (default: 40)
+Keys come from the server's environment (set by setup.sh):
+  PM_KEY_ID / PM_SECRET    your Polymarket US API key        (never put these in GitHub)
+  LIVE_DAILY_LOSS_LIMIT    stop for the day after losing this much      (default: 10)
+  LIVE_MAX_BETS_PER_DAY    stop for the day after this many bets        (default: 40)
+
+Which bots trade for real, and the master ON/OFF switch, are set from the dashboard and
+saved in the database. Each live bot bets its own paper size ($1 / $5 / $10).
+While the master switch is OFF, selected bots log the orders they *would* send (dry-run).
 
 Orders are FILL-OR-KILL limit orders at the exact price the bot saw: they fill completely at
 that price or not at all. Prices on Polymarket US are always quoted in Up ("YES") terms, so
@@ -55,12 +55,10 @@ def _f(x):
 
 
 class LiveTrader:
-    def __init__(self, db_path):
+    def __init__(self, db_path, strategies):
         self.key_id = os.environ.get("PM_KEY_ID", "").strip()
         secret = os.environ.get("PM_SECRET", "").strip()
-        self.enabled_env = os.environ.get("LIVE_ENABLED", "0").strip() == "1"
-        self.bots = [b.strip() for b in os.environ.get("LIVE_BOTS", "closer").split(",") if b.strip()]
-        self.usd = float(os.environ.get("LIVE_USD", "1") or 1)
+        self.sizes = {st["name"]: float(st.get("usd", 1.0)) for st in strategies}
         self.loss_limit = float(os.environ.get("LIVE_DAILY_LOSS_LIMIT", "10") or 10)
         self.max_bets = int(os.environ.get("LIVE_MAX_BETS_PER_DAY", "40") or 40)
         self.key = None
@@ -94,24 +92,36 @@ class LiveTrader:
             self.db.execute("INSERT OR REPLACE INTO live_state VALUES(?,?)", (k, str(v)))
             self.db.commit()
 
-    def stop(self, why="stopped from dashboard"):
-        self._set("stopped", why)
-        log.warning("LIVE TRADING STOPPED: %s", why)
+    # ---------------- dashboard controls ----------------
+    def armed(self):
+        return self._get("armed", "0") == "1"
 
-    def resume(self):
-        self._set("stopped", "")
-        log.warning("live trading resumed from dashboard")
+    def live_bots(self):
+        return [b for b in (self._get("bots", "") or "").split(",") if b in self.sizes]
+
+    def set_control(self, armed=None, bots=None):
+        if bots is not None:
+            unknown = [b for b in bots if b not in self.sizes]
+            if unknown:
+                raise ValueError(f"unknown bot(s): {', '.join(unknown)}")
+            self._set("bots", ",".join(bots))
+            log.warning("live bots set to: %s", ", ".join(bots) or "(none)")
+        if armed is not None:
+            if armed and self.mode() == "error":
+                raise ValueError("API keys aren't working")
+            self._set("armed", "1" if armed else "0")
+            log.warning("LIVE TRADING %s from dashboard (bots: %s)", "ON" if armed else "OFF",
+                        ", ".join(self.live_bots()) or "none")
+
+    def stop(self, why="stopped from dashboard"):
+        self.set_control(armed=False)
 
     def mode(self):
         if not self.key_id:
             return "off"
         if self.key is None or self.auth_ok is False:
             return "error"
-        if not self.enabled_env:
-            return "dry-run"
-        if self._get("stopped"):
-            return "stopped"
-        return "live"
+        return "live" if self.armed() else "dry-run"
 
     # ---------------- HTTP ----------------
     def _req(self, method, path, body=None, timeout=8):
@@ -171,7 +181,7 @@ class LiveTrader:
             return None
         return filled * ((1.0 if side == winner else 0.0) - cost) - comm
 
-    def _guards_ok(self):
+    def _guards_ok(self, usd):
         rows = [r for r in self._pnl_rows(self._today_start()) if r[9] == "live"]
         bets = sum(1 for r in rows if (r[5] or 0) > 0)
         if bets >= self.max_bets:
@@ -182,16 +192,17 @@ class LiveTrader:
             return False, f"daily loss limit hit (${realized:.2f} settled, ${open_risk:.2f} open)"
         if time.time() - self.balance_at > 300:
             self.refresh_balance()
-        if self.buying_power is not None and self.buying_power < self.usd + 0.25:
+        if self.buying_power is not None and self.buying_power < usd + 0.25:
             return False, f"not enough buying power (${self.buying_power:.2f})"
         return True, ""
 
     # ---------------- orders ----------------
     def submit(self, strategy, m, side, price, t_left, p_model):
         """Called by the paper bot right after it places a paper bet."""
-        if strategy not in self.bots or self.mode() not in ("live", "dry-run"):
+        if strategy not in self.live_bots() or self.mode() not in ("live", "dry-run"):
             return
-        self.q.put((time.time(), strategy, m["slug"], m["coin"], side, float(price), t_left, p_model))
+        self.q.put((time.time(), strategy, m["slug"], m["coin"], side, float(price), t_left, p_model,
+                    self.sizes[strategy]))
 
     def _record(self, **kw):
         cols = ",".join(kw)
@@ -199,18 +210,18 @@ class LiveTrader:
             self.db.execute(f"INSERT INTO live_orders({cols}) VALUES({','.join('?' * len(kw))})", tuple(kw.values()))
             self.db.commit()
 
-    def _place(self, ts, strategy, slug, coin, side, price, t_left, p_model):
-        qty = math.floor(self.usd / price * 100) / 100
+    def _place(self, ts, strategy, slug, coin, side, price, t_left, p_model, usd):
+        qty = math.floor(usd / price * 100) / 100
         base = dict(ts=ts, strategy=strategy, slug=slug, coin=coin, side=side, seen_price=price,
-                    usd=self.usd, qty=qty, t_left=t_left, p_model=p_model)
+                    usd=usd, qty=qty, t_left=t_left, p_model=p_model)
         mode = self.mode()
         if mode == "dry-run":
             self._record(mode="dry-run", state="NOT SENT", filled_qty=0, **base)
-            log.info("DRY-RUN would buy %s %s %.2f shares at %.2f (%s)", coin.upper(), side.upper(), qty, price, slug)
+            log.info("DRY-RUN %s would buy $%.0f %s %s at %.2f", strategy, usd, coin.upper(), side.upper(), price)
             return
         if mode != "live":
             return
-        ok, why = self._guards_ok()
+        ok, why = self._guards_ok(usd)
         if not ok:
             self._record(mode="live", state="SKIPPED", filled_qty=0, error=why, **base)
             log.warning("live bet skipped: %s", why)
@@ -258,7 +269,7 @@ class LiveTrader:
         self._record(mode="live", order_id=oid, state=state, filled_qty=filled, cost_px=cost,
                      commission=comm, latency_ms=latency, error=err, **base)
         if filled:
-            log.info("LIVE FILLED %s %s %.2f shares at %.3f (saw %.2f) fee $%.2f, %.0fms",
+            log.info("LIVE FILLED " + strategy + " %s %s %.2f shares at %.3f (saw %.2f) fee $%.2f, %.0fms",
                      coin.upper(), side.upper(), filled, cost or 0, price, comm, latency)
         else:
             log.info("LIVE NOT FILLED %s %s at %.2f (%s) %.0fms %s",
@@ -296,16 +307,22 @@ class LiveTrader:
         settled = [(r, self._row_pnl(r)) for r in filled if r[8] is not None]
         today = self._today_start()
         start_bal = self._get("start_balance")
+        per_bot = {}
+        for r, p in settled:
+            b = per_bot.setdefault(r[1], {"pnl": 0.0, "bets": 0, "wins": 0})
+            b["pnl"] += p
+            b["bets"] += 1
+            b["wins"] += p > 0
         recent = []
         for r in reversed(rows[-25:]):
             p = self._row_pnl(r)
-            recent.append({"ts": r[0], "coin": r[3], "side": r[4], "seen": r[11], "cost": r[6],
+            recent.append({"ts": r[0], "bot": r[1], "coin": r[3], "side": r[4], "seen": r[11], "cost": r[6],
                            "filled": r[5] or 0, "mode": r[9], "state": r[10], "error": r[13],
                            "latency": r[14], "winner": r[8], "pnl": p})
         return {
-            "mode": self.mode(), "bots": self.bots, "usd": self.usd,
+            "mode": self.mode(), "armed": self.armed(), "bots": self.live_bots(),
+            "sizes": self.sizes, "per_bot": per_bot,
             "loss_limit": self.loss_limit, "max_bets": self.max_bets,
-            "stopped_reason": self._get("stopped") or "",
             "auth_error": self.key_error or self.auth_error,
             "balance": self.balance, "buying_power": self.buying_power,
             "start_balance": float(start_bal) if start_bal else None,

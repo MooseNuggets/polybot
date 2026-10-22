@@ -253,6 +253,8 @@ svg{display:block;width:100%;height:auto}
 .lv{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
 .lv div b{display:block;font-size:20px;margin-top:2px}
 .lv div span{color:var(--mut);font-size:13px}
+.sw{min-width:64px;padding:8px 10px;border-radius:999px;border:1px solid var(--line);background:var(--chip);color:var(--mut);font-weight:700;font-size:13px;cursor:pointer}
+.sw-on{background:#2a2410;border-color:#8a6d2a;color:#f5b84a}.sw-live{background:#163a2b;border-color:#2f7d5b;color:var(--grn)}
 .btn.red{border-color:#7d2f33;color:var(--red)}.btn.grn{border-color:#2f7d5b;color:var(--grn)}
 .err{background:#3a1a1d;color:var(--red);padding:12px;border-radius:12px;margin-top:14px;display:none}
 </style></head>
@@ -349,42 +351,71 @@ function chart(eq, names) {
   $("legend").innerHTML = names.map((n, i) => `<span><i style="background:${COLORS[i%COLORS.length]}"></i>${n} <b class="${cls(eq.series[n].at(-1) - START)}">${money(eq.series[n].at(-1))}</b></span>`).join("");
 }
 
-function liveBox(L) {
+function liveBox(L, d) {
   const el = $("livebox");
   if (!L) { el.innerHTML = ""; return; }
+  if (L.mode === "off") {
+    el.innerHTML = `<div class="live"><h3>Live trading: not connected</h3><div class="mut">No Polymarket API keys on the server. Re-run setup to add them.</div></div>`;
+    return;
+  }
+  if (L.mode === "error") {
+    el.innerHTML = `<div class="live bad"><h3><span class="neg">●</span> Live trading: key problem</h3><div class="mut">${L.auth_error || "Could not use the API keys."}</div></div>`;
+    return;
+  }
+  const on = L.armed;
   const bal = L.balance != null ? money(L.balance) : "–";
   const chg = (L.balance != null && L.start_balance != null) ? L.balance - L.start_balance : null;
-  const rows = (L.recent || []).filter(r => r.mode === L.mode || L.mode === "stopped").slice(0, 6).map(r => {
+  const paper = Object.fromEntries((d.strategies || []).map(s => [s.name, s]));
+  const names = Object.keys(L.sizes || {});
+  const rows = names.map(n => {
+    const sel = L.bots.includes(n), pb = L.per_bot[n] || {pnl: 0, bets: 0}, pp = paper[n];
+    return `<tr><td><b>${n}</b><br><span class="mut">$${L.sizes[n]} per bet</span></td>
+      <td>${pp ? `<span class="${cls(pp.pnl)}">${smoney(pp.pnl)}</span>` : "–"}<br><span class="mut">paper</span></td>
+      <td>${pb.bets ? `<span class="${cls(pb.pnl)}">${smoney(pb.pnl)}</span>` : "–"}<br><span class="mut">live ${pb.bets || 0} bets</span></td>
+      <td><button class="sw ${sel ? (on ? "sw-live" : "sw-on") : ""}" data-bot="${n}">${sel ? (on ? "LIVE" : "ON") : "OFF"}</button></td></tr>`;
+  }).join("");
+  const recent = (L.recent || []).slice(0, 8).map(r => {
     const what = r.mode === "dry-run" ? "would buy" : (r.filled ? "bought" : (r.state === "SKIPPED" ? "skipped" : "missed"));
     const res = r.pnl != null ? `<span class="${cls(r.pnl)}">${smoney(r.pnl)}</span>` : (r.filled ? "open" : "");
-    return `<tr><td>${fmtT(r.ts)} ${r.coin.toUpperCase()} ${r.side.toUpperCase()}</td><td>${what} @ ${c2(r.filled ? r.cost : r.seen)}</td><td>${res}</td></tr>`;
+    return `<tr><td>${fmtT(r.ts)} ${r.coin.toUpperCase()} ${r.side.toUpperCase()}<br><span class="mut">${r.bot || ""}</span></td><td>${what} @ ${c2(r.filled ? r.cost : r.seen)}</td><td>${res}</td></tr>`;
   }).join("");
-  const table = rows ? `<div class="scroll" style="margin-top:12px"><table class="tbl">${rows}</table></div>` : "";
-  const copies = `copies <b>${L.bots.join(", ")}</b> · $${L.usd} per bet`;
-  if (L.mode === "off") {
-    el.innerHTML = `<div class="live"><h3>Live trading: off</h3><div class="mut">No API keys connected. To add them, re-run setup on the server.</div></div>`;
-  } else if (L.mode === "error") {
-    el.innerHTML = `<div class="live bad"><h3><span class="neg">●</span> Live trading: key problem</h3><div class="mut">${L.auth_error || "Could not use the API keys."}</div></div>`;
-  } else if (L.mode === "dry-run") {
-    el.innerHTML = `<div class="live dry"><h3><span style="color:#f5b84a">●</span> Live trading: DRY-RUN</h3>
-      <div class="mut">Keys work. ${copies}. Test mode: not sending real orders. To go live, re-run setup and answer 1 to "Send REAL orders?".</div>
-      <div class="lv"><div><span>Account balance</span><b>${bal}</b></div><div><span>Would-be bets</span><b>${(L.recent||[]).filter(r=>r.mode==="dry-run").length}</b></div></div>${table}</div>`;
-  } else {
-    const on = L.mode === "live";
-    el.innerHTML = `<div class="live ${on ? "on" : "bad"}"><h3><span class="${on ? "pos" : "neg"}">●</span> ${on ? "LIVE - real money" : "Live trading STOPPED"}</h3>
-      <div class="mut">${on ? copies + ` · stops after -$${L.loss_limit}/day or ${L.max_bets} bets/day` : (L.stopped_reason || "")}</div>
-      <div class="lv">
-        <div><span>Account balance</span><b>${bal}</b>${chg != null ? `<span class="${cls(chg)}">${smoney(chg)} since start</span>` : ""}</div>
-        <div><span>Live P/L (settled)</span><b class="${cls(L.pnl)}">${smoney(L.pnl)}</b><span>today ${smoney(L.today_pnl)}</span></div>
-        <div><span>Orders filled</span><b>${L.filled} / ${L.sent}</b><span>fill-or-kill at the seen price</span></div>
-        <div><span>Win rate</span><b>${L.settled ? pct(L.wins / L.settled) : "–"}</b><span>fees $${(L.fees||0).toFixed(2)}</span></div>
-      </div>${table}
-      <div class="row" style="margin:14px 0 0">${on ? `<a class="btn red" href="/live/stop?${k}">Stop live trading</a>` : `<a class="btn grn" href="/live/start?${k}">Resume live trading</a>`}</div></div>`;
-  }
+  el.innerHTML = `<div class="live ${on ? "on" : "dry"}">
+    <h3><span class="${on ? "pos" : ""}" style="${on ? "" : "color:#f5b84a"}">●</span> ${on ? "LIVE TRADING ON - real money" : "Live trading OFF"}</h3>
+    <div class="mut">${on ? "Selected bots place real bets." : "Selected bots only log the bets they would place."} Stops for the day after -$${L.loss_limit} or ${L.max_bets} bets.</div>
+    <div class="row" style="margin:14px 0 4px"><button class="btn ${on ? "red" : "grn"}" id="master">${on ? "Turn live trading OFF" : "Turn live trading ON"}</button></div>
+    <div class="lv">
+      <div><span>Account balance</span><b>${bal}</b>${chg != null ? `<span class="${cls(chg)}">${smoney(chg)} since start</span>` : ""}</div>
+      <div><span>Live P/L (settled)</span><b class="${cls(L.pnl)}">${smoney(L.pnl)}</b><span>today ${smoney(L.today_pnl)} · ${L.filled}/${L.sent} filled</span></div>
+    </div>
+    <div class="scroll" style="margin-top:12px"><table class="tbl">${rows}</table></div>
+    ${recent ? `<div class="mut" style="margin-top:14px">Recent</div><div class="scroll"><table class="tbl">${recent}</table></div>` : ""}
+  </div>`;
+  $("master").onclick = async () => {
+    if (!on) {
+      if (!L.bots.length) { alert("Switch at least one bot ON first."); return; }
+      const list = L.bots.map(n => `  ${n}: $${L.sizes[n]} per bet`).join("\n");
+      if (!confirm(`Start REAL-MONEY trading?\n\n${list}\n\nStops for the day after -$${L.loss_limit} or ${L.max_bets} bets.`)) return;
+    }
+    await setLive({armed: !on});
+  };
+  document.querySelectorAll("[data-bot]").forEach(b => b.onclick = async () => {
+    const n = b.dataset.bot, sel = L.bots.includes(n);
+    if (!sel && on && !confirm(`${n} will start placing REAL $${L.sizes[n]} bets right away. Continue?`)) return;
+    await setLive({bots: sel ? L.bots.filter(x => x !== n) : L.bots.concat([n])});
+  });
+}
+
+async function setLive(body) {
+  try {
+    const r = await fetch(`/live/set?${k}`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || ("error " + r.status));
+    if (last) { last.trader = j; render(last); }
+  } catch (e) { alert("Couldn't change live trading: " + e.message); }
 }
 
 function render(d) {
-  liveBox(d.trader);
+  liveBox(d.trader, d);
   const s = d.status;
   const ok = s.age != null && s.age < 60;
   $("sub").innerHTML = `Updated ${new Date(d.now*1000).toLocaleTimeString()} · ${ok ? '<span class="pos">● running</span>' : '<span class="neg">● stalled</span>'} · ${s.hours.toFixed(1)}h of data`;
