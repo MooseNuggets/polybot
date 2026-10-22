@@ -265,7 +265,7 @@ details.risk summary{cursor:pointer;color:var(--txt);font-weight:600}
 .err{background:#3a1a1d;color:var(--red);padding:12px;border-radius:12px;margin-top:14px;display:none}
 </style></head>
 <body><div class="wrap">
-  <h1>Polybot <span class="badge">PAPER</span> <span class="badge" id="label" style="display:none"></span></h1>
+  <h1>Polybot <span class="badge" id="modebadge">PAPER</span> <span class="badge" id="label" style="display:none"></span></h1>
   <div class="sub" id="sub">Loading…</div>
   <div class="err" id="err"></div>
   <div id="livebox"></div>
@@ -441,8 +441,15 @@ async function setLive(body) {
 function render(d) {
   liveBox(d.trader, d);
   const s = d.status;
-  const ok = s.age != null && s.age < 60;
-  $("sub").innerHTML = `Updated ${new Date(d.now*1000).toLocaleTimeString()} · ${ok ? '<span class="pos">● running</span>' : '<span class="neg">● stalled</span>'} · ${s.hours.toFixed(1)}h of data`;
+  const alive = s.heartbeat_age == null ? (s.age != null && s.age < 60) : s.heartbeat_age < 30;
+  const fresh = s.age != null && s.age < 60;
+  const state = !alive ? '<span class="neg">● stalled</span>'
+              : fresh ? '<span class="pos">● running</span>'
+              : '<span class="pos">● running</span> <span class="mut">(between windows)</span>';
+  $("sub").innerHTML = `Updated ${new Date(d.now*1000).toLocaleTimeString()} · ${state} · ${s.hours.toFixed(1)}h of data`;
+  const T = d.trader, liveOn = T && T.armed && T.mode === "live" && (T.bots || []).length;
+  $("modebadge").textContent = liveOn ? "LIVE" : "PAPER";
+  $("modebadge").style.cssText = liveOn ? "color:var(--grn);background:#163a2b" : "";
   const st = d.strategies;
   START = d.start;
   if (d.label) { $("label").textContent = d.label; $("label").style.display = ""; }

@@ -104,6 +104,9 @@ CREATE TABLE IF NOT EXISTS closer_signals (
     ptb REAL, est_close REAL, est_sd REAL, p_up REAL, up_ask REAL, down_ask REAL, action TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sig_slug ON closer_signals(slug);
+CREATE TABLE IF NOT EXISTS spot_prices (ts REAL, coin TEXT, price REAL);
+CREATE INDEX IF NOT EXISTS idx_spot_ts ON spot_prices(ts);
+CREATE TABLE IF NOT EXISTS basis_obs (ts REAL, coin TEXT, slug TEXT, basis REAL);
 """
 
 
@@ -600,10 +603,35 @@ def close_distribution(t_left, spot, observed_avg, observed_n, sigma):
 
 
 class PriceFeed:
-    def __init__(self):
+    def __init__(self, db=None):
+        self.db = db
         self.hist = {c: collections.deque(maxlen=1500) for c in COINBASE}   # (ts, price)
         self.basis = {c: collections.deque(maxlen=24) for c in COINBASE}    # index - coinbase, per window open
         self.basis_done = set()
+        if db is not None:
+            self._reload()
+
+    def _reload(self):
+        """After a restart, pick up where we left off instead of warming up again."""
+        since = time.time() - 1500
+        for ts, coin, price in self.db.execute(
+                "SELECT ts, coin, price FROM spot_prices WHERE ts >= ? ORDER BY ts", (since,)):
+            if coin in self.hist:
+                self.hist[coin].append((ts, price))
+        for coin in COINBASE:
+            rows = self.db.execute("SELECT slug, basis FROM basis_obs WHERE coin = ? ORDER BY ts DESC LIMIT 24",
+                                   (coin,)).fetchall()
+            for slug, b in reversed(rows):
+                self.basis[coin].append(b)
+                self.basis_done.add(slug)
+        n = sum(len(h) for h in self.hist.values())
+        log.info("price history reloaded: %d prices, basis samples %s", n,
+                 {c: len(b) for c, b in self.basis.items()})
+
+    def record(self, coin, ts, price):
+        self.hist[coin].append((ts, price))
+        if self.db is not None:
+            self.db.execute("INSERT INTO spot_prices VALUES(?,?,?)", (ts, coin, price))
 
     def latest(self, coin):
         h = self.hist[coin]
@@ -643,6 +671,8 @@ class PriceFeed:
         if n >= 40:
             self.basis[m["coin"]].append(m["ptb"] - avg)
             self.basis_done.add(m["slug"])
+            if self.db is not None:
+                self.db.execute("INSERT INTO basis_obs VALUES(?,?,?,?)", (time.time(), m["coin"], m["slug"], m["ptb"] - avg))
 
 
 class Closer:
@@ -716,7 +746,7 @@ class Runner:
         self.placed = set()
         self.totals = {}
         self.known = {}        # coin -> most recent market seen (used to guess the next window's name)
-        self.feed = PriceFeed()
+        self.feed = PriceFeed(db)
         self.closer = Closer(db, self.feed)
         self.ptb_try = {}
 
@@ -840,6 +870,7 @@ class Runner:
     async def prices(self):
         """Coin prices once a second, plus the 'price to beat' for each live window."""
         errs = 0
+        last_prune = 0
         while True:
             await asyncio.sleep(1 - (time.time() % 1))
             now = time.time()
@@ -851,7 +882,10 @@ class Runner:
                     if errs in (1, 10) or errs % 300 == 0:
                         log.warning("coin price read failed for %s (%d errors so far): %r", c, errs, p)
                     continue
-                self.feed.hist[c].append((now, p))
+                self.feed.record(c, now, p)
+            if now - last_prune > 600:
+                self.db.execute("DELETE FROM spot_prices WHERE ts < ?", (now - 7200,))
+                last_prune = now
             for m in list(self.markets.values()):
                 if m["start"] <= now <= m["end"]:
                     if not m.get("ptb") and now - m["start"] > 3 and now - self.ptb_try.get(m["slug"], 0) > 10:
@@ -1022,6 +1056,7 @@ def start_web():
                                                      STARTING_BALANCE, [x["name"] for x in STRATEGIES])
                         data["label"] = BOT_LABEL
                         data["trader"] = LIVE.snapshot() if LIVE is not None else None
+                        data["status"]["heartbeat_age"] = time.time() - HEARTBEAT[0]
                         out, ctype = json.dumps(data, default=list).encode(), "application/json"
                     self.send_response(200)
                 except Exception as e:
