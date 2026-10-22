@@ -30,12 +30,13 @@ ask() {  # ask NAME "question" default [secret]
 }
 echo
 echo ">> Settings (press Enter to keep what's in brackets)"
-ask REPORT_KEY "Dashboard password" ""
-while [ -z "$REPORT_KEY" ]; do echo "   A dashboard password is required."; ask REPORT_KEY "Dashboard password" ""; done
+ask REPORT_KEY "Dashboard password" "" secret
+while [ -z "$REPORT_KEY" ]; do echo "   A dashboard password is required."; ask REPORT_KEY "Dashboard password" "" secret; done
 ask PM_KEY_ID  "Polymarket US API Key ID (Enter to skip)" ""
 ask PM_SECRET  "Polymarket US API Secret Key - typing is hidden (Enter to skip)" "" secret
-ask LIVE_DAILY_LOSS_LIMIT "Stop for the day after losing this many dollars" "10"
-ask LIVE_MAX_BETS_PER_DAY "Stop for the day after this many bets" "40"
+# daily loss limit, bet cap and cooldowns are set on the dashboard (Live trading -> Safety limits)
+LIVE_DAILY_LOSS_LIMIT="$(current LIVE_DAILY_LOSS_LIMIT)"; LIVE_DAILY_LOSS_LIMIT="${LIVE_DAILY_LOSS_LIMIT:-10}"
+LIVE_MAX_BETS_PER_DAY="$(current LIVE_MAX_BETS_PER_DAY)"; LIVE_MAX_BETS_PER_DAY="${LIVE_MAX_BETS_PER_DAY:-40}"
 cat > "$ENV_FILE" <<ENV
 PYTHONUNBUFFERED=1
 PORT=8080
