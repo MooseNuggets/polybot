@@ -26,10 +26,15 @@ import threading
 import time
 import urllib.error
 import urllib.request
+
+import net
 from datetime import datetime
 
 log = logging.getLogger("polylog")
 API = "https://api.polymarket.us"
+MAX_SLIP = 0.04         # real orders may pay up to 4c more than the price the bot saw...
+MIN_EDGE_AFTER_SLIP = 0.01   # ...but only while our odds still beat the price by 1c+ after fees
+TAKER_THETA = 0.0695
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS live_orders (
@@ -82,7 +87,9 @@ class LiveTrader:
         if n:
             log.warning("%d live order(s) were mid-send during a restart - marked INTERRUPTED", n)
         self.q = queue.Queue()
+        self.check_q = queue.Queue()
         threading.Thread(target=self._worker, daemon=True).start()
+        threading.Thread(target=self._checker, daemon=True).start()
 
     # ---------------- state ----------------
     def _get(self, k, default=None):
@@ -129,15 +136,13 @@ class LiveTrader:
         ts = str(int(time.time() * 1000))
         sig = base64.b64encode(self.key.sign(f"{ts}{method}{path}".encode())).decode()
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(API + path, data=data, method=method, headers={
-            "X-PM-Access-Key": self.key_id, "X-PM-Timestamp": ts, "X-PM-Signature": sig,
-            "Content-Type": "application/json", "Accept": "application/json", "User-Agent": "polylog/2.0"})
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                raw = r.read()
-                return json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as e:
-            detail = e.read()[:400].decode(errors="replace")
+            _, raw = net.request(method, API + path, body=data, timeout=timeout, headers={
+                "X-PM-Access-Key": self.key_id, "X-PM-Timestamp": ts, "X-PM-Signature": sig,
+                "Content-Type": "application/json"})
+            return json.loads(raw) if raw else {}
+        except net.HTTPError as e:
+            detail = e.body[:400].decode(errors="replace")
             raise RuntimeError(f"HTTP {e.code} on {method} {path}: {detail}") from None
 
     def refresh_balance(self):
@@ -279,8 +284,6 @@ class LiveTrader:
         pnl = self.today_pnl(rows)
         if st["loss_limit"] > 0 and pnl <= -st["loss_limit"]:
             return False, f"daily loss limit hit: down ${-pnl:.2f} today (limit ${st['loss_limit']:.2f})"
-        if time.time() - self.balance_at > 300:
-            self.refresh_balance()
         if self.buying_power is not None and self.buying_power < usd + 0.25:
             return False, f"not enough buying power (${self.buying_power:.2f})"
         return True, ""
@@ -331,7 +334,19 @@ class LiveTrader:
             self._record(mode="live", state="SKIPPED", filled_qty=0, error=why, **base)
             log.warning("live bet skipped: %s", why)
             return
-        yes_px = price if side == "up" else round(1 - price, 2)
+        # wiggle room: allow paying up to MAX_SLIP more, as long as the bet stays profitable by our odds
+        limit = price
+        for c in range(int(round(MAX_SLIP * 100)), 0, -1):
+            cand = round(price + c / 100, 2)
+            if cand <= 0.99 and (p_model or 0) - cand - TAKER_THETA * cand * (1 - cand) >= MIN_EDGE_AFTER_SLIP:
+                limit = cand
+                break
+        qty = math.floor(usd / limit * 100) / 100      # keep the bet at ~$usd even at the higher limit
+        base["qty"] = qty
+        yes_px = limit if side == "up" else round(1 - limit, 2)
+        if limit > price:
+            log.info("%s %s %s: seen %.2f, will pay up to %.2f (model %.0f%%)", strategy, coin.upper(),
+                     side.upper(), price, limit, (p_model or 0) * 100)
         body = {
             "marketSlug": slug,
             "intent": "ORDER_INTENT_BUY_LONG" if side == "up" else "ORDER_INTENT_BUY_SHORT",
@@ -353,6 +368,12 @@ class LiveTrader:
             log.error("LIVE order error %s %s: %s", coin.upper(), side.upper(), e)
             return
         latency = (time.time() - t0) * 1000
+        log.info("LIVE SENT %s %s %s limit %.2f in %.0fms (%.1fs after signal)", strategy, coin.upper(),
+                 side.upper(), limit, latency, time.time() - ts)
+        self.check_q.put((row, resp, latency, strategy, coin, side, price))
+
+    def _finish(self, row, resp, latency, strategy, coin, side, price):
+        """Find out how a sent order ended (runs on its own thread so new orders never wait for this)."""
         oid = resp.get("id")
         raw_post = json.dumps(resp, separators=(",", ":"))[:300]
         raw_get = ""
@@ -367,7 +388,7 @@ class LiveTrader:
                 ex_val += sh * px
         try:
             o = {}
-            for wait in (0.3, 0.7, 1.5):          # IOC settles almost instantly; check a few times
+            for wait in (0.25, 0.5, 1.0, 2.0):    # IOC settles almost instantly; check a few times
                 time.sleep(wait)
                 got = self._req("GET", f"/v1/order/{oid}") if oid else {}
                 raw_get = json.dumps(got, separators=(",", ":"))[:300]
@@ -403,7 +424,19 @@ class LiveTrader:
         else:
             log.info("LIVE NOT FILLED %s %s at %.2f (%s) %.0fms %s",
                      coin.upper(), side.upper(), price, state, latency, err or "")
-        self.balance_at = 0   # refresh balance on next guard check
+        self.balance_at = 0   # refresh balance soon
+
+    def _checker(self):
+        while True:
+            item = self.check_q.get()
+            try:
+                self._finish(*item)
+            except Exception:
+                log.exception("live result check error")
+                try:
+                    self._update(item[0], state="UNKNOWN", error="result check crashed - check Polymarket activity")
+                except Exception:
+                    pass
 
     def _worker(self):
         last_bal = 0
@@ -412,11 +445,13 @@ class LiveTrader:
             last_bal = time.time()
         while True:
             try:
-                item = self.q.get(timeout=30)
+                item = self.q.get(timeout=20)
             except queue.Empty:
                 item = None
             try:
-                if self.key is not None and time.time() - last_bal > 120:
+                # refresh the balance every 25s while live (also keeps the order connection warm)
+                every = 25 if self.mode() == "live" else 120
+                if self.key is not None and (time.time() - last_bal > every or (not item and self.balance_at == 0)):
                     self.refresh_balance()
                     last_bal = time.time()
                 if item:

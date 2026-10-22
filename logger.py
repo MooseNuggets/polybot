@@ -20,6 +20,7 @@ import http.server
 import io
 import json
 import live
+import net
 import math
 import threading
 import traceback
@@ -38,7 +39,8 @@ from decimal import Decimal, ROUND_HALF_EVEN
 COINS = ["btc", "eth", "sol", "xrp"]
 ORDER_USD = 1.00          # every paper order is $1
 STARTING_BALANCE = 100.0  # each strategy gets its own $100 paper account
-POLL_EVERY = 1.0          # seconds between order-book reads
+POLL_EVERY = 1.0          # seconds between order-book and price reads...
+POLL_FAST = 0.5           # ...and twice as often during the last 2 minutes of a window, when bets happen
 WINDOW_SECONDS = 900      # 15 minutes
 ENTRY_SECONDS = 180       # paper orders can go in during the first 3 minutes of each window
 
@@ -115,9 +117,7 @@ def http_json(path, params=None):
     url = GATEWAY + path
     if params:
         url += "?" + urllib.parse.urlencode(params, doseq=True)
-    req = urllib.request.Request(url, headers={"User-Agent": "polylog/2.0", "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read())
+    return net.get_json(url, timeout=10)      # kept-alive connection: much faster than reconnecting
 
 
 def amt(x):
@@ -177,7 +177,7 @@ def guess_next_slug(known, start):
 def lookup_slug(slug):
     try:
         data = http_json(f"/v1/market/slug/{urllib.parse.quote(slug)}")
-    except urllib.error.HTTPError as e:
+    except (urllib.error.HTTPError, net.HTTPError) as e:
         if e.code == 404:
             return None
         raise
@@ -223,7 +223,7 @@ def read_book(slug):
 def read_settlement(slug):
     try:
         data = http_json(f"/v1/markets/{urllib.parse.quote(slug)}/settlement")
-    except urllib.error.HTTPError as e:
+    except (urllib.error.HTTPError, net.HTTPError) as e:
         if e.code == 404:
             return None
         raise
@@ -571,10 +571,8 @@ def window_pnl(db, slug, winner, mode="cautious"):
 # ------------------------------ closing-minute strategy ------------------------------
 def read_spot(coin):
     """Live coin price from Coinbase (one of the exchanges in the index Polymarket settles on)."""
-    req = urllib.request.Request(f"https://api.exchange.coinbase.com/products/{COINBASE[coin]}/ticker",
-                                 headers={"User-Agent": "polylog/2.0", "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=4) as r:
-        return float(json.loads(r.read())["price"])
+    return float(net.get_json(f"https://api.exchange.coinbase.com/products/{COINBASE[coin]}/ticker",
+                              timeout=4)["price"])
 
 
 def norm_cdf(x):
@@ -638,11 +636,19 @@ class PriceFeed:
         return h[-1] if h else (None, None)
 
     def avg_between(self, coin, t0, t1):
-        xs = [p for t, p in self.hist[coin] if t0 <= t < t1]
-        return (sum(xs) / len(xs), len(xs)) if xs else (None, 0)
+        """Average price in [t0, t1) and how many distinct seconds of that span we have prices for."""
+        pts = [(t, p) for t, p in self.hist[coin] if t0 <= t < t1]
+        if not pts:
+            return None, 0
+        return sum(p for _, p in pts) / len(pts), len({int(t) for t, _ in pts})
 
     def sigma(self, coin, lookback=900):
-        h = [x for x in self.hist[coin] if x[0] >= time.time() - lookback]
+        # one price per second (the last one in each second), so faster polling doesn't change the estimate
+        per_sec = {}
+        for t, p in self.hist[coin]:
+            if t >= time.time() - lookback:
+                per_sec[int(t)] = (t, p)
+        h = [per_sec[k] for k in sorted(per_sec)]
         if len(h) < 120:
             return None
         rets = []
@@ -696,7 +702,8 @@ class Closer:
         obs_avg, obs_n = self.feed.avg_between(coin, m["end"] - 60, now)
         if t_left <= 60 and obs_n < (60 - t_left) * 0.7:
             return                    # missing too much of the averaging minute to trust it
-        mean, sd = close_distribution(t_left, spot, obs_avg or spot, obs_n if t_left <= 60 else 0, sigma)
+        elapsed = max(0, min(60, int(60 - t_left))) if t_left <= 60 else 0   # seconds of the average already in
+        mean, sd = close_distribution(t_left, spot, obs_avg or spot, elapsed, sigma)
         mean += basis
         sd = math.sqrt(sd ** 2 + basis_sd ** 2)
         p_up = 1 - norm_cdf((m["ptb"] - mean) / sd) if sd > 0 else (1.0 if mean >= m["ptb"] else 0.0)
@@ -750,6 +757,11 @@ class Runner:
         self._reload_unsettled()
         self.closer = Closer(db, self.feed)
         self.ptb_try = {}
+
+    def step(self):
+        now = time.time()
+        closing = any(m["start"] <= now and 0 <= m["end"] - now <= CLOSER_FROM + 10 for m in self.markets.values())
+        return POLL_FAST if closing else POLL_EVERY
 
     def _reload_unsettled(self):
         """After a restart, keep waiting for results of windows that closed but weren't scored yet."""
@@ -828,7 +840,8 @@ class Runner:
         errs = {}
         while True:
           try:
-            await asyncio.sleep(POLL_EVERY - (time.time() % POLL_EVERY))
+            step = self.step()
+            await asyncio.sleep(step - (time.time() % step))
             now = time.time()
             HEARTBEAT[0] = now
             live = [m for m in self.markets.values() if m["start"] - 5 <= now <= m["end"]]
@@ -844,7 +857,7 @@ class Runner:
                     errs[m["slug"]] = n
                     if n in (1, 10) or n % 60 == 0:
                         log.warning("book read failed for %s (%d times): %r", m["slug"], n, book)
-                    if isinstance(book, urllib.error.HTTPError) and book.code == 429:
+                    if isinstance(book, (urllib.error.HTTPError, net.HTTPError)) and book.code == 429:
                         limited = True
                     continue
                 if errs.pop(m["slug"], 0):
@@ -885,7 +898,8 @@ class Runner:
         errs = 0
         last_prune = 0
         while True:
-            await asyncio.sleep(1 - (time.time() % 1))
+            step = self.step()
+            await asyncio.sleep(step - (time.time() % step))
             now = time.time()
             res = await asyncio.gather(*(asyncio.wait_for(asyncio.to_thread(read_spot, c), 4) for c in COINS),
                                        return_exceptions=True)
