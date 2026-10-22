@@ -354,6 +354,8 @@ class LiveTrader:
             return
         latency = (time.time() - t0) * 1000
         oid = resp.get("id")
+        raw_post = json.dumps(resp, separators=(",", ":"))[:300]
+        raw_get = ""
         filled, avg, comm, state, err = 0.0, None, 0.0, None, None
         ex_sh = ex_val = 0.0
         for ex in resp.get("executions") or []:
@@ -367,7 +369,9 @@ class LiveTrader:
             o = {}
             for wait in (0.3, 0.7, 1.5):          # IOC settles almost instantly; check a few times
                 time.sleep(wait)
-                o = (self._req("GET", f"/v1/order/{oid}") or {}).get("order", {}) if oid else {}
+                got = self._req("GET", f"/v1/order/{oid}") if oid else {}
+                raw_get = json.dumps(got, separators=(",", ":"))[:300]
+                o = (got or {}).get("order", {})
                 if o.get("state") not in ("ORDER_STATE_NEW", "ORDER_STATE_PENDING_NEW", "ORDER_STATE_PENDING_RISK"):
                     break
             state = o.get("state")
@@ -375,12 +379,16 @@ class LiveTrader:
             avg = _f(o.get("avgPx"))
             comm = _f(o.get("commissionNotionalTotalCollected")) or 0.0
         except Exception as e:
-            if "HTTP 404" not in str(e):      # rejected orders aren't kept, so 404 is expected then
+            if "HTTP 404" in str(e):          # Polymarket doesn't keep orders that never traded
+                raw_get = "order not kept by exchange (404)"
+            else:
                 err = (err + " | " if err else "") + f"status check failed: {e}"
         if not filled and ex_sh > 0:          # fall back to the fills reported with the order
             filled, avg = ex_sh, ex_val / ex_sh
         if state is None:
             state = "ORDER_STATE_REJECTED" if err else ("ORDER_STATE_FILLED" if filled else "UNKNOWN")
+        if not filled and not err:             # keep the exchange's exact words for anything that didn't fill
+            err = f"no fill. order reply: {raw_post} | status: {raw_get or '-'}"
         cost = None
         if filled and avg is not None:
             if side == "up":

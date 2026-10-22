@@ -388,7 +388,7 @@ function liveBox(L, d) {
     const what = r.mode === "dry-run" ? "would buy" : (r.filled ? "bought" : (r.state === "SKIPPED" ? "skipped" : (r.state === "DROPPED" ? "dropped" : r.state === "INTERRUPTED" ? "check Polymarket" : r.state === "SENDING" ? "sending..." : (r.error && r.error.startsWith("rejected") ? "rejected" : "missed"))));
     const why = !r.filled && r.mode !== "dry-run" ? (r.error || (r.state === "ORDER_STATE_CANCELED" ? "price moved before it arrived" : (r.state || ""))) : "";
     const res = r.pnl != null ? `<span class="${cls(r.pnl)}">${smoney(r.pnl)}</span>` : (r.filled ? "open" : "");
-    return `<tr><td>${fmtT(r.ts)} ${r.coin.toUpperCase()} ${r.side.toUpperCase()}<br><span class="mut">${r.bot || ""}</span></td><td>${what} @ ${c2(r.filled ? r.cost : r.seen)}${why ? `<br><span class="mut" style="white-space:normal">${why.replace(/</g, "&lt;").slice(0, 90)}</span>` : ""}</td><td>${res}</td></tr>`;
+    return `<tr><td>${fmtT(r.ts)} ${r.coin.toUpperCase()} ${r.side.toUpperCase()}<br><span class="mut">${r.bot || ""}</span></td><td>${what} @ ${c2(r.filled ? r.cost : r.seen)}${why ? `<br><span class="mut" style="white-space:normal">${why.replace(/</g, "&lt;").slice(0, 260)}</span>` : ""}</td><td>${res}</td></tr>`;
   }).join("");
   el.innerHTML = `<div class="live ${on ? "on" : "dry"}">
     <h3><span class="${on ? "pos" : ""}" style="${on ? "" : "color:#f5b84a"}">●</span> ${on ? "LIVE TRADING ON - real money" : "Live trading OFF"}</h3>
