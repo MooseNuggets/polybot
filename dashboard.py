@@ -362,12 +362,12 @@ function liveBox(L) {
   const table = rows ? `<div class="scroll" style="margin-top:12px"><table class="tbl">${rows}</table></div>` : "";
   const copies = `copies <b>${L.bots.join(", ")}</b> · $${L.usd} per bet`;
   if (L.mode === "off") {
-    el.innerHTML = `<div class="live"><h3>Live trading: off</h3><div class="mut">Add PM_KEY_ID and PM_SECRET in Railway Variables to connect your account.</div></div>`;
+    el.innerHTML = `<div class="live"><h3>Live trading: off</h3><div class="mut">No API keys connected. To add them, re-run setup on the server.</div></div>`;
   } else if (L.mode === "error") {
     el.innerHTML = `<div class="live bad"><h3><span class="neg">●</span> Live trading: key problem</h3><div class="mut">${L.auth_error || "Could not use the API keys."}</div></div>`;
   } else if (L.mode === "dry-run") {
     el.innerHTML = `<div class="live dry"><h3><span style="color:#f5b84a">●</span> Live trading: DRY-RUN</h3>
-      <div class="mut">Keys work. ${copies}. Not sending orders - set LIVE_ENABLED = 1 in Railway Variables to go live.</div>
+      <div class="mut">Keys work. ${copies}. Test mode: not sending real orders. To go live, re-run setup and answer 1 to "Send REAL orders?".</div>
       <div class="lv"><div><span>Account balance</span><b>${bal}</b></div><div><span>Would-be bets</span><b>${(L.recent||[]).filter(r=>r.mode==="dry-run").length}</b></div></div>${table}</div>`;
   } else {
     const on = L.mode === "live";
@@ -384,7 +384,7 @@ function liveBox(L) {
 }
 
 function render(d) {
-  liveBox(d.live);
+  liveBox(d.trader);
   const s = d.status;
   const ok = s.age != null && s.age < 60;
   $("sub").innerHTML = `Updated ${new Date(d.now*1000).toLocaleTimeString()} · ${ok ? '<span class="pos">● running</span>' : '<span class="neg">● stalled</span>'} · ${s.hours.toFixed(1)}h of data`;

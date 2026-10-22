@@ -994,7 +994,7 @@ def start_web():
                         data = dashboard.summary(DB_PATH, q.get("mode", ["cautious"])[0], q.get("coin", [""])[0],
                                                      STARTING_BALANCE, [x["name"] for x in STRATEGIES])
                         data["label"] = BOT_LABEL
-                        data["live"] = LIVE.snapshot() if LIVE is not None else None
+                        data["trader"] = LIVE.snapshot() if LIVE is not None else None
                         out, ctype = json.dumps(data, default=list).encode(), "application/json"
                     self.send_response(200)
                 except Exception as e:
