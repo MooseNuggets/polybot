@@ -329,6 +329,12 @@ class LiveTrader:
             return
         if mode != "live":
             return
+        with self.lock:
+            dup = self.db.execute("SELECT 1 FROM live_orders WHERE strategy=? AND slug=? AND mode='live' "
+                                  "AND state NOT IN ('SKIPPED','DROPPED') LIMIT 1", (strategy, slug)).fetchone()
+        if dup:
+            log.warning("live bet skipped: %s already sent an order on %s", strategy, slug)
+            return
         ok, why = self._guards_ok(usd)
         if not ok:
             self._record(mode="live", state="SKIPPED", filled_qty=0, error=why, **base)
@@ -354,7 +360,9 @@ class LiveTrader:
             "price": {"value": f"{yes_px:.2f}", "currency": "USD"},
             "quantity": qty,
             "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
-        }   # same fields as Polymarket's own example order - nothing optional
+            "synchronousExecution": True,   # wait for the result, so the reply says exactly what happened
+            "maxBlockTime": "1",
+        }
         row = self._record(mode="live", state="SENDING", filled_qty=0, **base)   # saved before anything is sent
         if time.time() - ts > 10:
             self._update(row, state="DROPPED", error="too slow (signal >10s old) - not sent")
@@ -370,18 +378,23 @@ class LiveTrader:
         latency = (time.time() - t0) * 1000
         log.info("LIVE SENT %s %s %s limit %.2f in %.0fms (%.1fs after signal)", strategy, coin.upper(),
                  side.upper(), limit, latency, time.time() - ts)
-        self.check_q.put((row, resp, latency, strategy, coin, side, price))
+        self.check_q.put((row, resp, latency, strategy, coin, side, price, slug))
 
-    def _finish(self, row, resp, latency, strategy, coin, side, price):
+    def _finish(self, row, resp, latency, strategy, coin, side, price, slug=None):
         """Find out how a sent order ended (runs on its own thread so new orders never wait for this)."""
         oid = resp.get("id")
         raw_post = json.dumps(resp, separators=(",", ":"))[:300]
         raw_get = ""
         filled, avg, comm, state, err = 0.0, None, 0.0, None, None
         ex_sh = ex_val = 0.0
+        notes = []
         for ex in resp.get("executions") or []:
             if ex.get("orderRejectReason") and "UNSPECIFIED" not in str(ex.get("orderRejectReason")):
                 err = str(ex.get("orderRejectReason")).replace("ORD_REJECT_REASON_", "rejected: ")
+            for k in ("type", "unsolicitedCancelReason", "text"):
+                v = ex.get(k)
+                if v and "UNSPECIFIED" not in str(v):
+                    notes.append(str(v).replace("EXECUTION_TYPE_", "").replace("UNSOLICITED_CXL_REASON_", "cancel reason: "))
             sh, px = _f(ex.get("lastShares")) or 0.0, _f(ex.get("lastPx"))
             if sh > 0 and px is not None:
                 ex_sh += sh
@@ -407,9 +420,12 @@ class LiveTrader:
         if not filled and ex_sh > 0:          # fall back to the fills reported with the order
             filled, avg = ex_sh, ex_val / ex_sh
         if state is None:
-            state = "ORDER_STATE_REJECTED" if err else ("ORDER_STATE_FILLED" if filled else "UNKNOWN")
-        if not filled and not err:             # keep the exchange's exact words for anything that didn't fill
-            err = f"no fill. order reply: {raw_post} | status: {raw_get or '-'}"
+            state = "ORDER_STATE_REJECTED" if err else ("ORDER_STATE_FILLED" if filled else
+                     ("ORDER_STATE_CANCELED" if "CANCELED" in notes else "UNKNOWN"))
+        if not filled:
+            said = ", ".join(dict.fromkeys(notes)) or "-"
+            mkt = self._market_now(slug, side)
+            err = (err + " | " if err else "no fill. ") + f"Polymarket said: {said}. {mkt} | order reply: {raw_post} | status: {raw_get or '-'}"
         cost = None
         if filled and avg is not None:
             if side == "up":
@@ -425,6 +441,27 @@ class LiveTrader:
             log.info("LIVE NOT FILLED %s %s at %.2f (%s) %.0fms %s",
                      coin.upper(), side.upper(), price, state, latency, err or "")
         self.balance_at = 0   # refresh balance soon
+
+    @staticmethod
+    def _market_now(slug, side):
+        """Right after a miss: what was really on offer? Tells us if the price we saw was already gone."""
+        if not slug:
+            return ""
+        try:
+            d = net.get_json(f"https://gateway.polymarket.us/v1/markets/{slug}/book?_={int(time.time()*1000)}",
+                             timeout=4, headers={"Cache-Control": "no-cache"})
+            md = d.get("marketData", d)
+            asks = sorted((_f(l.get("px")), _f(l.get("qty"))) for l in md.get("offers") or [] if _f(l.get("px")))
+            bids = sorted(((_f(l.get("px")), _f(l.get("qty"))) for l in md.get("bids") or [] if _f(l.get("px"))), reverse=True)
+            if side == "up":
+                best = asks[0] if asks else None
+            else:
+                best = (round(1 - bids[0][0], 2), bids[0][1]) if bids else None
+            if not best:
+                return f"Market right after: nobody selling {side.upper()}."
+            return f"Market right after: {side.upper()} cheapest {best[0]*100:.0f}c ({best[1]:.0f} available)."
+        except Exception as e:
+            return f"(market check failed: {e})"
 
     def _checker(self):
         while True:

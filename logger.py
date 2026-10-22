@@ -203,7 +203,9 @@ def find_markets():
 
 
 def read_book(slug):
-    data = http_json(f"/v1/markets/{urllib.parse.quote(slug)}/book")
+    # unique "_" value so no cache in between can ever hand us an old copy of the book
+    data = net.get_json(GATEWAY + f"/v1/markets/{urllib.parse.quote(slug)}/book?_={int(time.time() * 1000)}",
+                        timeout=10, headers={"Cache-Control": "no-cache"})
     md = data.get("marketData", data)
     bids = [(amt(l.get("px")), float(l.get("qty") or 0)) for l in md.get("bids", []) or []]
     offers = [(amt(l.get("px")), float(l.get("qty") or 0)) for l in md.get("offers", []) or []]

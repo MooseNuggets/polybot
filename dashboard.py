@@ -357,6 +357,7 @@ function chart(eq, names) {
   $("legend").innerHTML = names.map((n, i) => `<span><i style="background:${COLORS[i%COLORS.length]}"></i>${n} <b class="${cls(eq.series[n].at(-1) - START)}">${money(eq.series[n].at(-1))}</b></span>`).join("");
 }
 
+const OPEN_WHY = new Set();   // keeps "full details" open across refreshes
 function liveBox(L, d) {
   const el = $("livebox");
   const a = document.activeElement;
@@ -366,6 +367,14 @@ function liveBox(L, d) {
     el.innerHTML = `<div class="live"><h3>Live trading: not connected</h3><div class="mut">No Polymarket API keys on the server. Re-run setup to add them.</div></div>`;
     return;
   }
+  const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  const whyHtml = (w, k) => {
+    const i = w.indexOf(" | order reply");
+    const short = i > 0 ? w.slice(0, i) : w.slice(0, 200);
+    const more = i > 0 ? w.slice(i + 3) : w.slice(200);
+    return `<br><span class="mut" style="white-space:normal">${esc(short)}</span>` +
+      (more ? `<details data-k="${k}" ${OPEN_WHY.has(String(k)) ? "open" : ""} class="mut" style="white-space:normal;word-break:break-all"><summary>full details</summary>${esc(more)}</details>` : "");
+  };
   if (L.mode === "error") {
     el.innerHTML = `<div class="live bad"><h3><span class="neg">●</span> Live trading: key problem</h3><div class="mut">${L.auth_error || "Could not use the API keys."}</div></div>`;
     return;
@@ -388,7 +397,7 @@ function liveBox(L, d) {
     const what = r.mode === "dry-run" ? "would buy" : (r.filled ? "bought" : (r.state === "SKIPPED" ? "skipped" : (r.state === "DROPPED" ? "dropped" : r.state === "INTERRUPTED" ? "check Polymarket" : r.state === "SENDING" ? "sending..." : (r.error && r.error.startsWith("rejected") ? "rejected" : "missed"))));
     const why = !r.filled && r.mode !== "dry-run" ? (r.error || (r.state === "ORDER_STATE_CANCELED" ? "price moved before it arrived" : (r.state || ""))) : "";
     const res = r.pnl != null ? `<span class="${cls(r.pnl)}">${smoney(r.pnl)}</span>` : (r.filled ? "open" : "");
-    return `<tr><td>${fmtT(r.ts)} ${r.coin.toUpperCase()} ${r.side.toUpperCase()}<br><span class="mut">${r.bot || ""}</span></td><td>${what} @ ${c2(r.filled ? r.cost : r.seen)}${why ? `<br><span class="mut" style="white-space:normal">${why.replace(/</g, "&lt;").slice(0, 260)}</span>` : ""}</td><td>${res}</td></tr>`;
+    return `<tr><td>${fmtT(r.ts)} ${r.coin.toUpperCase()} ${r.side.toUpperCase()}<br><span class="mut">${r.bot || ""}</span></td><td>${what} @ ${c2(r.filled ? r.cost : r.seen)}${why ? whyHtml(why, r.ts) : ""}</td><td>${res}</td></tr>`;
   }).join("");
   el.innerHTML = `<div class="live ${on ? "on" : "dry"}">
     <h3><span class="${on ? "pos" : ""}" style="${on ? "" : "color:#f5b84a"}">●</span> ${on ? "LIVE TRADING ON - real money" : "Live trading OFF"}</h3>
@@ -407,6 +416,8 @@ function liveBox(L, d) {
     </details>
     ${recent ? `<div class="mut" style="margin-top:14px">Recent</div><div class="scroll"><table class="tbl">${recent}</table></div>` : ""}
   </div>`;
+  el.querySelectorAll("details[data-k]").forEach(x => x.addEventListener("toggle", () =>
+    x.open ? OPEN_WHY.add(x.dataset.k) : OPEN_WHY.delete(x.dataset.k)));
   $("master").onclick = async () => {
     if (!on) {
       if (!L.bots.length) { alert("Switch at least one bot ON first."); return; }
