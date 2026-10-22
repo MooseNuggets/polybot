@@ -75,9 +75,12 @@ class LiveTrader:
         self.buying_power = None
         self.balance_at = 0
         self.lock = threading.Lock()
-        self.db = sqlite3.connect(db_path, check_same_thread=False, timeout=15)
+        self.db = sqlite3.connect(db_path, check_same_thread=False, timeout=30, isolation_level=None)
         self.db.executescript(SCHEMA)
-        self.db.commit()
+        n = self.db.execute("UPDATE live_orders SET state='INTERRUPTED', error='bot restarted while sending - "
+                            "check Polymarket activity for this order' WHERE state='SENDING'").rowcount
+        if n:
+            log.warning("%d live order(s) were mid-send during a restart - marked INTERRUPTED", n)
         self.q = queue.Queue()
         threading.Thread(target=self._worker, daemon=True).start()
 
@@ -88,9 +91,7 @@ class LiveTrader:
         return r[0] if r else default
 
     def _set(self, k, v):
-        with self.lock:
-            self.db.execute("INSERT OR REPLACE INTO live_state VALUES(?,?)", (k, str(v)))
-            self.db.commit()
+        self._write("INSERT OR REPLACE INTO live_state VALUES(?,?)", (k, str(v)))
 
     # ---------------- dashboard controls ----------------
     def armed(self):
@@ -292,11 +293,27 @@ class LiveTrader:
         self.q.put((time.time(), strategy, m["slug"], m["coin"], side, float(price), t_left, p_model,
                     self.sizes[strategy]))
 
+    def _write(self, sql, args=()):
+        """Database write with retries - a busy database must never lose a record of a real order."""
+        for attempt in range(6):
+            try:
+                with self.lock:
+                    cur = self.db.execute(sql, args)
+                return cur.lastrowid
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e) and "busy" not in str(e):
+                    raise
+                log.warning("database busy, retrying (%d)", attempt + 1)
+                time.sleep(0.5 * (attempt + 1))
+        raise RuntimeError("database stayed busy - could not save live order record")
+
     def _record(self, **kw):
         cols = ",".join(kw)
-        with self.lock:
-            self.db.execute(f"INSERT INTO live_orders({cols}) VALUES({','.join('?' * len(kw))})", tuple(kw.values()))
-            self.db.commit()
+        return self._write(f"INSERT INTO live_orders({cols}) VALUES({','.join('?' * len(kw))})", tuple(kw.values()))
+
+    def _update(self, row_id, **kw):
+        sets = ",".join(f"{k}=?" for k in kw)
+        self._write(f"UPDATE live_orders SET {sets} WHERE id=?", tuple(kw.values()) + (row_id,))
 
     def _place(self, ts, strategy, slug, coin, side, price, t_left, p_model, usd):
         qty = math.floor(usd / price * 100) / 100
@@ -323,12 +340,16 @@ class LiveTrader:
             "quantity": qty,
             "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
         }   # same fields as Polymarket's own example order - nothing optional
+        row = self._record(mode="live", state="SENDING", filled_qty=0, **base)   # saved before anything is sent
+        if time.time() - ts > 10:
+            self._update(row, state="DROPPED", error="too slow (signal >10s old) - not sent")
+            log.warning("live bet not sent: signal went stale")
+            return
         t0 = time.time()
         try:
             resp = self._req("POST", "/v1/orders", body)
         except Exception as e:
-            self._record(mode="live", state="ERROR", filled_qty=0, error=str(e)[:500],
-                         latency_ms=(time.time() - t0) * 1000, **base)
+            self._update(row, state="ERROR", error=str(e)[:500], latency_ms=(time.time() - t0) * 1000)
             log.error("LIVE order error %s %s: %s", coin.upper(), side.upper(), e)
             return
         latency = (time.time() - t0) * 1000
@@ -366,8 +387,8 @@ class LiveTrader:
                 cost = avg
             else:   # the API may report Down fills in Up terms (0.07) or Down terms (0.93)
                 cost = avg if abs(avg - price) < abs((1 - avg) - price) else 1 - avg
-        self._record(mode="live", order_id=oid, state=state, filled_qty=filled, cost_px=cost,
-                     commission=comm, latency_ms=latency, error=err, **base)
+        self._update(row, order_id=oid, state=state, filled_qty=filled, cost_px=cost,
+                     commission=comm, latency_ms=latency, error=err)
         if filled:
             log.info("LIVE FILLED " + strategy + " %s %s %.2f shares at %.3f (saw %.2f) fee $%.2f, %.0fms",
                      coin.upper(), side.upper(), filled, cost or 0, price, comm, latency)

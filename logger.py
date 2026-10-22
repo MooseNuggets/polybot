@@ -1114,7 +1114,8 @@ def start_web():
 
 async def main():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    db = sqlite3.connect(DB_PATH)
+    # autocommit: every write is saved immediately, so the live trader never waits on a long-held lock
+    db = sqlite3.connect(DB_PATH, isolation_level=None, timeout=30)
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript(SCHEMA)
     try:
