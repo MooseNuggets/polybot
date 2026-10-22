@@ -747,8 +747,21 @@ class Runner:
         self.totals = {}
         self.known = {}        # coin -> most recent market seen (used to guess the next window's name)
         self.feed = PriceFeed(db)
+        self._reload_unsettled()
         self.closer = Closer(db, self.feed)
         self.ptb_try = {}
+
+    def _reload_unsettled(self):
+        """After a restart, keep waiting for results of windows that closed but weren't scored yet."""
+        now = time.time()
+        rows = self.db.execute(
+            "SELECT slug, coin, window_start, window_end, price_to_beat FROM markets "
+            "WHERE winner IS NULL AND window_end < ? AND window_end > ?", (now, now - 24 * 3600)).fetchall()
+        for slug, coin, ws, we, ptb in rows:
+            self.markets.setdefault(slug, {"slug": slug, "coin": coin, "start": ws, "end": we, "ptb": ptb})
+            self.placed.add(slug)
+        if rows:
+            log.info("picked up %d closed windows still waiting for results", len(rows))
 
     def _track(self, m):
         now = time.time()
@@ -923,7 +936,7 @@ class Runner:
                              datetime.fromtimestamp(m["start"]).strftime("%H:%M"), winner.upper(),
                              "  ".join(f"{k} {v:+.2f}" for k, v in pnl.items()))
                     self._forget(m["slug"])
-                elif now > m["end"] + 3 * 3600:
+                elif now > m["end"] + 24 * 3600:
                     log.warning("gave up waiting for settlement of %s", m["slug"])
                     self._forget(m["slug"])
                 await asyncio.sleep(0.3)
