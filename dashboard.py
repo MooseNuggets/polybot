@@ -396,7 +396,7 @@ function liveBox(L, d) {
     <div class="row" style="margin:14px 0 4px"><button class="btn ${on ? "red" : "grn"}" id="master">${on ? "Turn live trading OFF" : "Turn live trading ON"}</button></div>
     <div class="lv">
       <div><span>Account balance</span><b>${bal}</b>${chg != null ? `<span class="${cls(chg)}">${smoney(chg)} since start</span>` : ""}</div>
-      <div><span>Live P/L (settled)</span><b class="${cls(L.pnl)}">${smoney(L.pnl)}</b><span>today ${smoney(L.today_pnl)} · ${L.filled}/${L.sent} filled</span></div>
+      <div><span>Live P/L (settled)</span><b class="${cls(L.pnl)}">${smoney(L.pnl)}</b><span>today ${smoney(L.today_pnl)} (stops at -$${S.loss_limit}) · ${L.filled}/${L.sent} filled</span></div>
     </div>
     <div class="scroll" style="margin-top:12px"><table class="tbl">${rows}</table></div>
     <details class="risk"${window.__riskOpen ? " open" : ""}><summary>Safety limits</summary>
@@ -410,7 +410,7 @@ function liveBox(L, d) {
     if (!on) {
       if (!L.bots.length) { alert("Switch at least one bot ON first."); return; }
       const list = L.bots.map(n => `  ${n}: $${L.sizes[n]} per bet`).join("\n");
-      if (!confirm(`Start REAL-MONEY trading?\n\n${list}\n\nStops for the day after -$${S.loss_limit} or ${S.max_bets} bets. Cooldown after ${S.cd_losses || "-"} losses in a row.`)) return;
+      if (!confirm(`Start REAL-MONEY trading?\n\n${list}\n\nStops for the day if today's live result reaches -$${S.loss_limit}, or after ${S.max_bets} bets. Cooldown after ${S.cd_losses || "-"} losses in a row.`)) return;
     }
     await setLive({armed: !on});
   };

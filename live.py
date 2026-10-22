@@ -183,8 +183,8 @@ class LiveTrader:
 
     # ---------------- risk settings (editable from the dashboard) ----------------
     SETTINGS = {   # name: (type, min, max, label)
-        "loss_limit": (float, 0, 100000, "Daily loss limit ($)"),
-        "max_bets":   (int,   0, 10000,  "Daily bet cap"),
+        "loss_limit": (float, 0, 100000, "Daily loss limit ($ - stops when today's live result is down this much, 0 = off)"),
+        "max_bets":   (int,   0, 10000,  "Daily bet cap (0 = off)"),
         "cd_losses":  (int,   0, 100,    "Losses in a row before cooldown (0 = off)"),
         "cd_dollars": (float, 0, 100000, "$ lost within 1 hour before cooldown (0 = off)"),
         "cd_minutes": (int,   1, 10080,  "Cooldown length (minutes)"),
@@ -260,6 +260,12 @@ class LiveTrader:
             return until, reason
         return 0, ""
 
+    def today_pnl(self, rows=None):
+        """Settled live profit/loss since midnight (Alaska time on the server)."""
+        if rows is None:
+            rows = [r for r in self._pnl_rows(self._today_start()) if r[9] == "live"]
+        return sum(p for p in (self._row_pnl(r) for r in rows) if p is not None)
+
     def _guards_ok(self, usd):
         st = self.settings()
         until, why = self.cooldown()
@@ -267,12 +273,11 @@ class LiveTrader:
             return False, f"cooling down until {datetime.fromtimestamp(until).strftime('%H:%M')} ({why})"
         rows = [r for r in self._pnl_rows(self._today_start()) if r[9] == "live"]
         bets = sum(1 for r in rows if (r[5] or 0) > 0)
-        if bets >= st["max_bets"]:
+        if st["max_bets"] > 0 and bets >= st["max_bets"]:
             return False, f"daily bet cap reached ({bets})"
-        realized = sum(p for p in (self._row_pnl(r) for r in rows) if p is not None)
-        open_risk = sum((r[5] or 0) * (r[6] or 0) for r in rows if (r[5] or 0) > 0 and r[8] is None)
-        if realized - open_risk <= -st["loss_limit"]:
-            return False, f"daily loss limit hit (${realized:.2f} settled, ${open_risk:.2f} open)"
+        pnl = self.today_pnl(rows)
+        if st["loss_limit"] > 0 and pnl <= -st["loss_limit"]:
+            return False, f"daily loss limit hit: down ${-pnl:.2f} today (limit ${st['loss_limit']:.2f})"
         if time.time() - self.balance_at > 300:
             self.refresh_balance()
         if self.buying_power is not None and self.buying_power < usd + 0.25:
