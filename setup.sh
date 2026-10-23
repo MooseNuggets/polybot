@@ -14,7 +14,7 @@ apt-get update -y -qq
 apt-get install -y -qq python3 python3-venv python3-pip git curl caddy >/dev/null
 python3 -m venv "$DIR/venv"
 "$DIR/venv/bin/pip" install -q --upgrade pip
-"$DIR/venv/bin/pip" install -q "cryptography==43.0.3"
+"$DIR/venv/bin/pip" install -q "cryptography==43.0.3" "websockets==13.1"
 mkdir -p "$DIR/data"
 
 # ---------- settings ----------

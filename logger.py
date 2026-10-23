@@ -21,6 +21,7 @@ import io
 import json
 import live
 import net
+import streams
 import math
 import threading
 import traceback
@@ -608,6 +609,7 @@ class PriceFeed:
         self.hist = {c: collections.deque(maxlen=1500) for c in COINBASE}   # (ts, price)
         self.basis = {c: collections.deque(maxlen=24) for c in COINBASE}    # index - coinbase, per window open
         self.basis_done = set()
+        self.now = {}                                                        # coin -> newest (ts, price)
         if db is not None:
             self._reload()
 
@@ -629,11 +631,19 @@ class PriceFeed:
                  {c: len(b) for c, b in self.basis.items()})
 
     def record(self, coin, ts, price):
-        self.hist[coin].append((ts, price))
+        """Keeps one price per second (the latest in that second) - the stream can send dozens."""
+        self.now[coin] = (ts, price)
+        h = self.hist[coin]
+        if h and int(h[-1][0]) == int(ts):
+            h[-1] = (ts, price)
+            return
+        h.append((ts, price))
         if self.db is not None:
             self.db.execute("INSERT INTO spot_prices VALUES(?,?,?)", (ts, coin, price))
 
     def latest(self, coin):
+        if coin in self.now:
+            return self.now[coin]
         h = self.hist[coin]
         return h[-1] if h else (None, None)
 
@@ -688,6 +698,7 @@ class Closer:
         self.db, self.feed = db, feed
         self.bet = set()              # (strategy, slug) already bet
         self.ptb_checked = {}
+        self.sig_logged = {}
 
     def step(self, m, book, now):
         t_left = m["end"] - now
@@ -741,6 +752,9 @@ class Closer:
                     LIVE.submit(st["name"], m, side, ask, t_left, p_up if side == "up" else 1 - p_up)
                 log.info("%s BUY $%.0f %s %s at %.2f | model %.0f%% Up, %.0fs left, edge %.1fc",
                          st["name"], usd, coin.upper(), side.upper(), ask, p_up * 100, t_left, edge * 100)
+        if not actions and now - self.sig_logged.get(m["slug"], 0) < 1.0:
+            return
+        self.sig_logged[m["slug"]] = now
         self.db.execute("INSERT INTO closer_signals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (now, m["slug"], coin, round(t_left, 1), spot, basis, sigma, m["ptb"],
                          mean, sd, p_up, up_ask, down_ask, ",".join(actions) or None))
@@ -759,6 +773,62 @@ class Runner:
         self._reload_unsettled()
         self.closer = Closer(db, self.feed)
         self.ptb_try = {}
+        self.books = {}        # slug -> freshest book (stream or normal check, whichever is newer)
+        self.last_eval = {}
+        self.spot_stream = streams.SpotStream(COINBASE, self.on_spot)
+        self.book_stream = None   # set in main() when API keys are present
+
+    # ---------- streams: react the instant a price changes ----------
+    def merge_book(self, slug, book, read_started):
+        """Normal check result: take its sizes etc., but never overwrite a newer streamed price."""
+        cur = self.books.get(slug)
+        new = dict(book, bid_ts=read_started, ask_ts=read_started)
+        if cur:
+            for k in ("bid", "ask"):
+                if cur.get(k + "_ts", 0) > read_started:
+                    new[k], new[k + "_ts"] = cur[k], cur[k + "_ts"]
+        self.books[slug] = new
+        return new
+
+    def on_book(self, slug, ts, upd):
+        cur = self.books.get(slug)
+        if cur is None:
+            return                     # wait for one normal check first (it brings the sizes)
+        for k, v in upd.items():
+            cur[k], cur[k + "_ts"] = v, ts
+        m = self.markets.get(slug)
+        if m:
+            self._evaluate(m)
+
+    def on_spot(self, coin, ts, price):
+        self.feed.record(coin, ts, price)
+        for m in list(self.markets.values()):
+            if m["coin"] == coin:
+                self._evaluate(m)
+
+    def _evaluate(self, m):
+        now = time.time()
+        if not (CLOSER_UNTIL <= m["end"] - now <= CLOSER_FROM):
+            return
+        if now - self.last_eval.get(m["slug"], 0) < 0.05:
+            return
+        book = self.books.get(m["slug"])
+        if not book or now - max(book.get("bid_ts", 0), book.get("ask_ts", 0)) > 3 and not (
+                self.book_stream and self.book_stream.healthy()):
+            return
+        self.last_eval[m["slug"]] = now
+        try:
+            self.closer.step(m, book, now)
+        except Exception:
+            log.exception("closer error on %s", m["slug"])
+
+    def stream_status(self):
+        return {"coin_prices": self.spot_stream.status(),
+                "polymarket": self.book_stream.status() if self.book_stream else None}
+
+    def wanted_slugs(self):
+        now = time.time()
+        return {m["slug"] for m in self.markets.values() if m["start"] - 5 <= now <= m["end"]}
 
     def step(self):
         now = time.time()
@@ -875,16 +945,19 @@ class Runner:
                 elif m["slug"] in self.placed:
                     self.paper.update(m, book, self.prev.get(m["slug"]), t_in)
                 self.prev[m["slug"]] = book
-                try:
-                    self.closer.step(m, book, now)
-                except Exception:
-                    log.exception("closer error on %s", m["slug"])
+                merged = self.merge_book(m["slug"], book, now)
+                if CLOSER_UNTIL <= m["end"] - time.time() <= CLOSER_FROM:
+                    self.last_eval[m["slug"]] = time.time()
+                    try:
+                        self.closer.step(m, merged, time.time())
+                    except Exception:
+                        log.exception("closer error on %s", m["slug"])
             if now - last_commit > 5:
                 self.db.commit()
                 last_commit = now
             if now - last_health > 300:
-                log.info("health: %d live windows, %d book reads in last 5 min | paper P/L so far: %s",
-                         len(live), rows, self._fmt_totals())
+                log.info("health: %d live windows, %d book reads in last 5 min | streams %s | paper P/L so far: %s",
+                         len(live), rows, self.stream_status(), self._fmt_totals())
                 rows, last_health = 0, now
             if limited:
                 log.warning("rate limited by Polymarket; pausing 3s")
@@ -903,9 +976,11 @@ class Runner:
             step = self.step()
             await asyncio.sleep(step - (time.time() % step))
             now = time.time()
-            res = await asyncio.gather(*(asyncio.wait_for(asyncio.to_thread(read_spot, c), 4) for c in COINS),
+            streamed = self.spot_stream.healthy(5)
+            need = [c for c in COINS if not (streamed and now - self.feed.latest(c)[0] < 3)]
+            res = await asyncio.gather(*(asyncio.wait_for(asyncio.to_thread(read_spot, c), 4) for c in need),
                                        return_exceptions=True)
-            for c, p in zip(COINS, res):
+            for c, p in zip(need, res):
                 if isinstance(p, BaseException):
                     errs += 1
                     if errs in (1, 10) or errs % 300 == 0:
@@ -972,6 +1047,7 @@ LIVE = None   # set in main(): live.LiveTrader
 
 # ------------------------------ watchdog ------------------------------
 HEARTBEAT = [time.time()]
+RUNNER = [None]
 
 
 def start_watchdog(limit=90):
@@ -1086,6 +1162,7 @@ def start_web():
                         data["label"] = BOT_LABEL
                         data["trader"] = LIVE.snapshot() if LIVE is not None else None
                         data["status"]["heartbeat_age"] = time.time() - HEARTBEAT[0]
+                        data["status"]["streams"] = RUNNER[0].stream_status() if RUNNER[0] else None
                         out, ctype = json.dumps(data, default=list).encode(), "application/json"
                     self.send_response(200)
                 except Exception as e:
@@ -1144,6 +1221,7 @@ async def main():
     log.info("live trading: %s | live bots: %s", "ON" if LIVE.armed() else "off",
              ", ".join(LIVE.live_bots()) or "none")
     r = Runner(db)
+    RUNNER[0] = r
     log.info("Polymarket US 15-min logger + paper trader | coins: %s | $%.2f per order",
              ",".join(COINS), max(st.get("usd", ORDER_USD) for st in STRATEGIES))
     start_web()
@@ -1151,7 +1229,11 @@ async def main():
         log.info("check: %s", ln)
     start_watchdog()
     try:
-        await asyncio.gather(r.discover(), r.fast_discover(), r.poll(), r.settle(), r.prices())
+        tasks = [r.discover(), r.fast_discover(), r.poll(), r.settle(), r.prices(), r.spot_stream.run()]
+        if LIVE.key is not None:
+            r.book_stream = streams.BookStream(LIVE.key_id, LIVE.key, r.wanted_slugs, r.on_book)
+            tasks.append(r.book_stream.run())
+        await asyncio.gather(*tasks)
     except Exception:
         log.exception("crashed - restarting")
         time.sleep(1)

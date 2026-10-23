@@ -37,8 +37,15 @@ The **Model check** on the dashboard compares the model's odds with the market's
    - Tap **Turn live trading ON** to start real orders. It asks you to confirm and lists what will be bet.
    - Each live bot bets its own size ($1 / $5 / $10). Tap **Turn live trading OFF** to stop instantly.
 
-Real orders are immediate-or-cancel at the exact price the bot saw: whatever's available at that price or better fills instantly, the rest is cancelled. Never a worse price.
-Daily safety limits (set during setup): stop after a $10 loss or 40 bets per day.
+Real orders are immediate-or-cancel limit orders: whatever's available at the limit or better fills instantly,
+the rest is cancelled. The limit may be up to 4c above the price seen, only while the bet still has a 1c+ edge.
+Daily safety limits (loss limit, bet cap, cooldowns) are edited on the dashboard under **Safety limits**.
+
+**Live price streams:** coin prices (Coinbase) and Polymarket best bid/ask are pushed to the bot the moment they
+change, so it reacts in milliseconds instead of at its next once-a-second check. The dashboard shows
+"⚡ live prices" when both streams are up. If a stream drops, the bot reconnects on its own and meanwhile keeps
+working from its normal checks. Update command (installs the stream package):
+`cd /root/polybot && git pull && venv/bin/pip install -q websockets==13.1 && sudo systemctl restart polylog`
 The dashboard is served over **https** (`https://YOUR-IP-WITH-DASHES.sslip.io`) so the password
 and switches are encrypted.
 
