@@ -177,7 +177,7 @@ class LiveTrader:
             return self.db.execute("""
                 SELECT l.ts, l.strategy, l.slug, l.coin, l.side, l.filled_qty, l.cost_px, l.commission,
                        m.winner, l.mode, l.state, l.seen_price, l.usd, l.error, l.latency_ms, m.settled_at
-                FROM live_orders l LEFT JOIN markets m ON m.slug = l.slug
+                FROM live_orders l LEFT JOIN (SELECT slug, MAX(winner) winner, MAX(settled_at) settled_at FROM markets GROUP BY slug) m ON m.slug = l.slug
                 WHERE l.ts >= ? ORDER BY l.ts""", (since,)).fetchall()
 
     @staticmethod

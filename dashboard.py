@@ -460,7 +460,7 @@ function render(d) {
               : '<span class="pos">● running</span> <span class="mut">(between windows)</span>';
   const S2 = s.streams || {}, sOn = x => x && x.on;
   const nOn = [S2.coin_prices, S2.polymarket].filter(sOn).length, nAll = [S2.coin_prices, S2.polymarket].filter(Boolean).length;
-  const streamTxt = !nAll ? "" : nOn === nAll ? ' · <span class="pos">⚡ live prices</span>'
+  const streamTxt = !nAll ? "" : nOn === nAll ? ` · <span class="pos">⚡ live prices</span>${S2.stream_vs_check ? ` <span class="mut">(${S2.stream_vs_check})</span>` : ""}`
                   : ` · <span style="color:#f5b84a">⚡ ${nOn}/${nAll} price streams</span>`;
   $("sub").innerHTML = `Updated ${new Date(d.now*1000).toLocaleTimeString()} · ${state}${streamTxt} · ${s.hours.toFixed(1)}h of data`;
   const T = d.trader, liveOn = T && T.armed && T.mode === "live" && (T.bots || []).length;

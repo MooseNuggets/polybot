@@ -775,6 +775,7 @@ class Runner:
         self.ptb_try = {}
         self.books = {}        # slug -> freshest book (stream or normal check, whichever is newer)
         self.last_eval = {}
+        self.cmp = [0, 0]      # [comparisons, disagreements] between streamed and checked prices
         self.spot_stream = streams.SpotStream(COINBASE, self.on_spot)
         self.book_stream = None   # set in main() when API keys are present
 
@@ -783,6 +784,12 @@ class Runner:
         """Normal check result: take its sizes etc., but never overwrite a newer streamed price."""
         cur = self.books.get(slug)
         new = dict(book, bid_ts=read_started, ask_ts=read_started)
+        if cur and self.book_stream and self.book_stream.healthy():
+            # how often does the stream's price match a normal check? (shown in the health log)
+            for k in ("bid", "ask"):
+                if cur.get(k + "_ts", 0) < read_started and cur.get(k) is not None and book.get(k) is not None:
+                    self.cmp[0] += 1
+                    self.cmp[1] += abs(cur[k] - book[k]) > 0.005
         if cur:
             for k in ("bid", "ask"):
                 if cur.get(k + "_ts", 0) > read_started:
@@ -823,7 +830,8 @@ class Runner:
             log.exception("closer error on %s", m["slug"])
 
     def stream_status(self):
-        return {"coin_prices": self.spot_stream.status(),
+        return {"stream_vs_check": f"{self.cmp[1]}/{self.cmp[0]} differ",
+                "coin_prices": self.spot_stream.status(),
                 "polymarket": self.book_stream.status() if self.book_stream else None}
 
     def wanted_slugs(self):
