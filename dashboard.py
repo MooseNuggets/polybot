@@ -394,7 +394,7 @@ function liveBox(L, d) {
       <td><button class="sw ${sel ? (on ? "sw-live" : "sw-on") : ""}" data-bot="${n}">${sel ? (on ? "LIVE" : "ON") : "OFF"}</button></td></tr>`;
   }).join("");
   const recent = (L.recent || []).slice(0, 12).map(r => {
-    const what = r.mode === "dry-run" ? "would buy" : (r.filled ? "bought" : (r.state === "SKIPPED" ? "skipped" : (r.state === "DROPPED" ? "dropped" : r.state === "INTERRUPTED" ? "check Polymarket" : r.state === "SENDING" ? "sending..." : (r.error && r.error.startsWith("rejected") ? "rejected" : "missed"))));
+    const what = r.mode === "dry-run" ? "would buy" : (r.filled ? "bought" : (r.state === "SKIPPED" ? "skipped" : (r.state === "DROPPED" ? "dropped" : r.state === "INTERRUPTED" ? "check Polymarket" : r.state === "SENDING" ? "sending..." : (r.error && r.error.startsWith("rejected") && !/EXPIRED|CANCELED/.test(r.error) ? "rejected" : "missed"))));
     const why = !r.filled && r.mode !== "dry-run" ? (r.error || (r.state === "ORDER_STATE_CANCELED" ? "price moved before it arrived" : (r.state || ""))) : "";
     const res = r.pnl != null ? `<span class="${cls(r.pnl)}">${smoney(r.pnl)}</span>` : (r.filled ? "open" : "");
     return `<tr><td>${fmtT(r.ts)} ${r.coin.toUpperCase()} ${r.side.toUpperCase()}<br><span class="mut">${r.bot || ""}</span></td><td>${what} @ ${c2(r.filled ? r.cost : r.seen)}${why ? whyHtml(why, r.ts) : ""}</td><td>${res}</td></tr>`;

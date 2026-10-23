@@ -389,7 +389,8 @@ class LiveTrader:
         ex_sh = ex_val = 0.0
         notes = []
         for ex in resp.get("executions") or []:
-            if ex.get("orderRejectReason") and "UNSPECIFIED" not in str(ex.get("orderRejectReason")):
+            if (ex.get("orderRejectReason") and "UNSPECIFIED" not in str(ex.get("orderRejectReason"))
+                    and ex.get("type") not in ("EXECUTION_TYPE_EXPIRED", "EXECUTION_TYPE_CANCELED")):
                 err = str(ex.get("orderRejectReason")).replace("ORD_REJECT_REASON_", "rejected: ")
             for k in ("type", "unsolicitedCancelReason", "text"):
                 v = ex.get(k)
@@ -423,7 +424,10 @@ class LiveTrader:
             state = "ORDER_STATE_REJECTED" if err else ("ORDER_STATE_FILLED" if filled else
                      ("ORDER_STATE_CANCELED" if "CANCELED" in notes else "UNKNOWN"))
         if not filled:
+            notes = [n for n in notes if "UNDEFINED" not in n]
             said = ", ".join(dict.fromkeys(notes)) or "-"
+            if "EXPIRED" in notes or "CANCELED" in notes:
+                said += " (nothing for sale at our price)"
             mkt = self._market_now(slug, side)
             err = (err + " | " if err else "no fill. ") + f"Polymarket said: {said}. {mkt} | order reply: {raw_post} | status: {raw_get or '-'}"
         cost = None
